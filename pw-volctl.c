@@ -666,7 +666,7 @@ static gboolean on_close_request(GtkWindow *window, gpointer user_data) {
 static const char *APP_CSS =
     "window { background-color: #263238; }"
 
-    ".device-name  { font-size: 15px; font-weight: bold; color: #ffffff; }"
+    ".device-name  { font-size: 14px; font-weight: bold; color: #ffffff; }"
     ".device-class { font-size: 12px; color: #90caf9; }"
     ".file-label   { font-size: 12px; color: #4fc3f7; }"
     ".pct-label    { font-size: 26px; font-weight: bold; color: #42a5f5; }"
@@ -825,11 +825,6 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_margin_end(ctrl_vbox,   12);
     gtk_box_append(GTK_BOX(right_vbox), ctrl_vbox);
 
-    app->lbl_file = gtk_label_new("Live levels");
-    gtk_widget_add_css_class(app->lbl_file, "file-label");
-    gtk_label_set_xalign(GTK_LABEL(app->lbl_file), 0.0f);
-    gtk_box_append(GTK_BOX(ctrl_vbox), app->lbl_file);
-
     app->lbl_name = gtk_label_new("No device selected");
     gtk_widget_add_css_class(app->lbl_name, "device-name");
     gtk_label_set_ellipsize(GTK_LABEL(app->lbl_name), PANGO_ELLIPSIZE_END);
@@ -887,13 +882,25 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_box_append(GTK_BOX(root_vbox),
         gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
 
+    GtkWidget *status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+    app->lbl_file = gtk_label_new("Live levels");
+    gtk_widget_add_css_class(app->lbl_file, "file-label");
+    gtk_widget_set_margin_start(app->lbl_file,  8);
+    gtk_widget_set_margin_top(app->lbl_file,    3);
+    gtk_widget_set_margin_bottom(app->lbl_file, 3);
+    gtk_box_append(GTK_BOX(status_bar), app->lbl_file);
+
     app->status_lbl = gtk_label_new("");
     gtk_widget_add_css_class(app->status_lbl, "status-label");
     gtk_label_set_xalign(GTK_LABEL(app->status_lbl), 1.0f);
+    gtk_widget_set_hexpand(app->status_lbl, TRUE);
     gtk_widget_set_margin_end(app->status_lbl,    10);
     gtk_widget_set_margin_top(app->status_lbl,     3);
     gtk_widget_set_margin_bottom(app->status_lbl,  3);
-    gtk_box_append(GTK_BOX(root_vbox), app->status_lbl);
+    gtk_box_append(GTK_BOX(status_bar), app->status_lbl);
+
+    gtk_box_append(GTK_BOX(root_vbox), status_bar);
 
 
     populate_list(app);
