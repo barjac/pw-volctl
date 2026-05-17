@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PipeWire Volume Control
+GenericName=Audio Level Control
+Comment=Adjust and save PipeWire audio device levels
+Exec=pw-volctl
+Icon=pw-volctl
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;volume;pipewire;levels;mixer;
