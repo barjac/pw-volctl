@@ -1,22 +1,14 @@
 /*
- * pw-volctl.c - PipeWire Volume Control GTK4/C
+ * pw-volctl.c
+ * PipeWire Volume Control - GTK4/C
  *
- * Copyright (C) 2026  Barry C Jackson
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * *******************************************************************************
+ * Reads the last-used preset file on startup (if any), otherwise reads live
+ * volumes from wpctl. Slider changes apply in real time via wpctl.
+ * Revert restores the in-memory snapshot of the last loaded/saved file.
+ * Save / Load use a file chooser for named presets.
  *
  * Build:
- *   gcc $(pkg-config --cflags gtk4) -o pw-volctl pw-volctl.c $(pkg-config --libs gtk4) -lm
+ *   gcc $(pkg-config --cflags gtk4) -o pw-volctl pw-volctl.c $(pkg-config --libs gtk4)
  */
 
 #include <gtk/gtk.h>
@@ -98,6 +90,8 @@ static void build_paths(void) {
     snprintf(temp_path,   sizeof(temp_path),   TEMP_PATH,   home);
     snprintf(last_path,   sizeof(last_path),   LAST_PATH,   home);
     snprintf(default_dir, sizeof(default_dir), DEFAULT_DIR, home);
+    /* Create config directory if it does not exist */
+    g_mkdir_with_parents(default_dir, 0755);
 }
 
 static char *read_last_file(void) {
@@ -184,6 +178,21 @@ static void display_name(const char *full, char *out, int outlen) {
     g_strlcat(out, dir_suffix, outlen);
 }
 
+/* ── Device sort ─────────────────────────────────────────────────────────── */
+/* Strip alsa_input./alsa_output. prefix so ports of the same device sort
+ * adjacent; secondary sort on the full name keeps input before output. */
+static int cmp_device(const void *a, const void *b) {
+    const Device *da = (const Device *)a;
+    const Device *db = (const Device *)b;
+    const char *ka = da->name, *kb = db->name;
+    if (g_str_has_prefix(ka, "alsa_output.")) ka += strlen("alsa_output.");
+    else if (g_str_has_prefix(ka, "alsa_input.")) ka += strlen("alsa_input.");
+    if (g_str_has_prefix(kb, "alsa_output.")) kb += strlen("alsa_output.");
+    else if (g_str_has_prefix(kb, "alsa_input.")) kb += strlen("alsa_input.");
+    int r = strcmp(ka, kb);
+    return r ? r : strcmp(da->name, db->name);
+}
+
 /* ── Live read from wpctl ────────────────────────────────────────────────── */
 
 static void load_live(void) {
@@ -246,6 +255,7 @@ static void load_live(void) {
         devices[n_devices].vol      = candidates[i].vol;
         n_devices++;
     }
+    qsort(devices, n_devices, sizeof(Device), cmp_device);
 }
 
 /* ── File I/O ────────────────────────────────────────────────────────────── */
@@ -268,6 +278,7 @@ static int load_file(const char *path) {
         n_devices++;
     }
     fclose(f);
+    qsort(devices, n_devices, sizeof(Device), cmp_device);
     return n_devices;
 }
 
@@ -367,6 +378,7 @@ static void populate_list(AppData *app) {
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(app->list_box)) != NULL)
         gtk_list_box_remove(GTK_LIST_BOX(app->list_box), child);
+    gtk_widget_queue_draw(app->list_box);
 
     for (int i = 0; i < n_devices; i++) {
         if (!app->show_all && devices[i].vol >= 0.995) continue;
@@ -652,66 +664,47 @@ static gboolean on_close_request(GtkWindow *window, gpointer user_data) {
 /* ── CSS ─────────────────────────────────────────────────────────────────── */
 
 static const char *APP_CSS =
-    "window { background-color: #2b2b2b; }"
+    "window { background-color: #263238; }"
 
-    /* Device name — bold white */
-    ".device-name  { font-size: 16px; font-weight: bold; color: #ffffff; }"
+    ".device-name  { font-size: 15px; font-weight: bold; color: #ffffff; }"
+    ".device-class { font-size: 12px; color: #90caf9; }"
+    ".file-label   { font-size: 12px; color: #4fc3f7; }"
+    ".pct-label    { font-size: 26px; font-weight: bold; color: #42a5f5; }"
+    ".status-label { font-size: 11px; color: #ffcc02; }"
 
-    /* Class — larger and clearly visible */
-    ".device-class { font-size: 13px; color: #b0bec5; }"
-    ".file-label   { font-size: 13px; font-style: italic; color: #4fc3f7; }"
+    "list         { background-color: #1c252b; }"
+    "row          { color: #eceff1; font-size: 12px; }"
+    "row:selected { background-color: #1565c0; color: #ffffff; }"
 
-    /* Big percentage readout */
-    ".pct-label    { font-size: 32px; font-weight: bold; color: #4fc3f7; }"
-
-    /* Status bar */
-    ".status-label { font-size: 11px; color: #ffb74d; }"
-
-    /* Device list */
-    "list          { background-color: #2b2b2b; }"
-    "row           { color: #cccccc; font-size: 12px; }"
-    "row:selected  { background-color: #1565c0; color: #ffffff; }"
-
-    /* Slider */
-    "scale trough  { background-color: #616161; min-height: 8px; }"
-    "scale highlight { background-color: #4fc3f7; }"
-
-    /* Standard buttons — light grey, clearly readable */
     "button {"
-    "  background: #607d8b;"    /* blue-grey */
-    "  color: #ffffff;"
+    "  background: #1976d2; color: #ffffff;"
     "  border: none; border-radius: 4px; padding: 6px 14px; }"
-    "button:hover   { background: #78909c; }"
-    "button:disabled { background: #37474f; color: #78909c; }"
+    "button:hover    { background: #1e88e5; }"
+    "button:disabled { background: #0d2d5e; color: #4a7fbf; }"
 
-    /* Toolbar buttons */
     ".btn-toolbar {"
-    "  background: #455a64; color: #ffffff;"
+    "  background: #1976d2; color: #ffffff;"
     "  border: none; border-radius: 4px;"
     "  padding: 3px 12px; font-size: 12px; }"
-    ".btn-toolbar:hover    { background: #546e7a; }"
-    ".btn-toolbar:disabled { background: #263238; color: #546e7a; }"
+    ".btn-toolbar:hover    { background: #1e88e5; }"
+    ".btn-toolbar:disabled { background: #0d2d5e; color: #4a7fbf; }"
 
-    /* Revert toolbar button */
     ".btn-toolbar-revert {"
-    "  background: #bf360c; color: #ffffff;"
+    "  background: #c62828; color: #ffffff;"
     "  border: none; border-radius: 4px;"
     "  padding: 3px 12px; font-size: 12px; }"
-    ".btn-toolbar-revert:hover    { background: #e64a19; }"
-    ".btn-toolbar-revert:disabled { background: #3e1f00; color: #7a4010; }"
+    ".btn-toolbar-revert:hover    { background: #ef5350; }"
+    ".btn-toolbar-revert:disabled { background: #4a1515; color: #ef9a9a; }"
 
-
-    /* Step buttons — compact */
     ".btn-step {"
-    "  background: #546e7a; color: #ffffff;"
+    "  background: #1565c0; color: #ffffff;"
     "  border: none; border-radius: 4px;"
-    "  padding: 3px 10px;"
-    "  font-size: 12px; font-weight: bold; }"
-    ".btn-step:hover    { background: #607d8b; }"
-    ".btn-step:disabled { background: #2e3d44; color: #546e7a; }"
+    "  padding: 4px 14px;"
+    "  font-size: 14px; font-weight: bold; }"
+    ".btn-step:hover    { background: #1976d2; }"
+    ".btn-step:disabled { background: #0d3a6e; color: #5c8abf; }"
 
-
-    "separator { background-color: #444444; min-height: 1px; margin: 2px 0; }";
+    "separator { background-color: #37474f; min-height: 1px; margin: 2px 0; }";
 
 /* ── App activate ────────────────────────────────────────────────────────── */
 
@@ -742,8 +735,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     /* ── Window ── */
     app->window = gtk_application_window_new(gtk_app);
     gtk_window_set_title(GTK_WINDOW(app->window), "PipeWire Volume Control");
-    gtk_window_set_default_size(GTK_WINDOW(app->window), 400, 320);
-    gtk_window_set_resizable(GTK_WINDOW(app->window), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(app->window), 440, 200);
     g_signal_connect(app->window, "close-request",
         G_CALLBACK(on_close_request), app);
 
@@ -828,7 +820,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_vexpand(spacer_top, TRUE);
     gtk_box_append(GTK_BOX(right_vbox), spacer_top);
 
-    GtkWidget *ctrl_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *ctrl_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_margin_start(ctrl_vbox, 12);
     gtk_widget_set_margin_end(ctrl_vbox,   12);
     gtk_box_append(GTK_BOX(right_vbox), ctrl_vbox);
@@ -840,7 +832,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     app->lbl_name = gtk_label_new("No device selected");
     gtk_widget_add_css_class(app->lbl_name, "device-name");
-    gtk_label_set_wrap(GTK_LABEL(app->lbl_name), TRUE);
+    gtk_label_set_ellipsize(GTK_LABEL(app->lbl_name), PANGO_ELLIPSIZE_END);
     gtk_label_set_xalign(GTK_LABEL(app->lbl_name), 0.0f);
     gtk_box_append(GTK_BOX(ctrl_vbox), app->lbl_name);
 

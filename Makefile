@@ -1,6 +1,6 @@
 CC      = gcc
 TARGET  = pw-volctl
-SRC     = pw-volctl11.c
+SRC     = pw-volctl.c
 
 CFLAGS  = $(shell pkg-config --cflags gtk4) -Wall -Wextra -O2
 LIBS    = $(shell pkg-config --libs gtk4) -lm
