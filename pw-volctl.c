@@ -879,48 +879,61 @@ static gboolean on_close_request(GtkWindow *window, gpointer user_data) {
 
 /* ── CSS ─────────────────────────────────────────────────────────────────── */
 
+/*
+ * Every selector below is scoped under .pwvolctl-main (added to app->window
+ * only, see activate()) rather than left bare. gtk_style_context_add_
+ * provider_for_display() applies this CSS display-wide, to EVERY window
+ * this process creates -- including GtkAlertDialog/GtkFileDialog's own
+ * internal windows -- not just app->window, so unscoped rules like the old
+ * bare "window { background-color: #263238; }" darkened those dialogs' own
+ * backgrounds too while their default (unstyled) text stayed dark, making
+ * e.g. the close-confirmation alert's text unreadable. Every rule gets the
+ * exact same ".pwvolctl-main " prefix so relative specificity between them
+ * (e.g. .btn-toolbar overriding the plain button rule) is unchanged --
+ * only the absolute match scope narrows.
+ */
 static const char *APP_CSS =
-    "window { background-color: #263238; }"
+    ".pwvolctl-main { background-color: #263238; }"
 
-    ".device-name  { font-size: 14px; font-weight: bold; color: #ffffff; }"
-    ".device-class { font-size: 12px; color: #90caf9; }"
-    ".file-label   { font-size: 12px; color: #4fc3f7; }"
-    ".pct-label    { font-size: 26px; font-weight: bold; color: #42a5f5; }"
-    ".status-label { font-size: 11px; color: #ffcc02; }"
+    ".pwvolctl-main .device-name  { font-size: 14px; font-weight: bold; color: #ffffff; }"
+    ".pwvolctl-main .device-class { font-size: 12px; color: #90caf9; }"
+    ".pwvolctl-main .file-label   { font-size: 12px; color: #4fc3f7; }"
+    ".pwvolctl-main .pct-label    { font-size: 26px; font-weight: bold; color: #42a5f5; }"
+    ".pwvolctl-main .status-label { font-size: 11px; color: #ffcc02; }"
 
-    "list         { background-color: #1c252b; }"
-    "row          { color: #eceff1; font-size: 12px; }"
-    "row:selected { background-color: #1565c0; color: #ffffff; }"
+    ".pwvolctl-main list         { background-color: #1c252b; }"
+    ".pwvolctl-main row          { color: #eceff1; font-size: 12px; }"
+    ".pwvolctl-main row:selected { background-color: #1565c0; color: #ffffff; }"
 
-    "button {"
+    ".pwvolctl-main button {"
     "  background: #1976d2; color: #ffffff;"
     "  border: none; border-radius: 4px; padding: 6px 14px; }"
-    "button:hover    { background: #1e88e5; }"
-    "button:disabled { background: #0d2d5e; color: #4a7fbf; }"
+    ".pwvolctl-main button:hover    { background: #1e88e5; }"
+    ".pwvolctl-main button:disabled { background: #0d2d5e; color: #4a7fbf; }"
 
-    ".btn-toolbar {"
+    ".pwvolctl-main .btn-toolbar {"
     "  background: #1976d2; color: #ffffff;"
     "  border: none; border-radius: 4px;"
     "  padding: 3px 12px; font-size: 12px; }"
-    ".btn-toolbar:hover    { background: #1e88e5; }"
-    ".btn-toolbar:disabled { background: #0d2d5e; color: #4a7fbf; }"
+    ".pwvolctl-main .btn-toolbar:hover    { background: #1e88e5; }"
+    ".pwvolctl-main .btn-toolbar:disabled { background: #0d2d5e; color: #4a7fbf; }"
 
-    ".btn-toolbar-revert {"
+    ".pwvolctl-main .btn-toolbar-revert {"
     "  background: #c62828; color: #ffffff;"
     "  border: none; border-radius: 4px;"
     "  padding: 3px 12px; font-size: 12px; }"
-    ".btn-toolbar-revert:hover    { background: #ef5350; }"
-    ".btn-toolbar-revert:disabled { background: #4a1515; color: #ef9a9a; }"
+    ".pwvolctl-main .btn-toolbar-revert:hover    { background: #ef5350; }"
+    ".pwvolctl-main .btn-toolbar-revert:disabled { background: #4a1515; color: #ef9a9a; }"
 
-    ".btn-step {"
+    ".pwvolctl-main .btn-step {"
     "  background: #1565c0; color: #ffffff;"
     "  border: none; border-radius: 4px;"
     "  padding: 4px 14px;"
     "  font-size: 14px; font-weight: bold; }"
-    ".btn-step:hover    { background: #1976d2; }"
-    ".btn-step:disabled { background: #0d3a6e; color: #5c8abf; }"
+    ".pwvolctl-main .btn-step:hover    { background: #1976d2; }"
+    ".pwvolctl-main .btn-step:disabled { background: #0d3a6e; color: #5c8abf; }"
 
-    "separator { background-color: #37474f; min-height: 1px; margin: 2px 0; }";
+    ".pwvolctl-main separator { background-color: #37474f; min-height: 1px; margin: 2px 0; }";
 
 /* ── App activate ────────────────────────────────────────────────────────── */
 
@@ -953,6 +966,8 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     /* ── Window ── */
     app->window = gtk_application_window_new(gtk_app);
+    /* Scopes APP_CSS to just this window -- see the comment above APP_CSS. */
+    gtk_widget_add_css_class(app->window, "pwvolctl-main");
     gtk_window_set_title(GTK_WINDOW(app->window), "PipeWire Volume Control");
     gtk_window_set_default_size(GTK_WINDOW(app->window), 440, 200);
     g_signal_connect(app->window, "close-request",
