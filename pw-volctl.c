@@ -389,7 +389,10 @@ static void format_level_label(AppData *app, double val, char *out, size_t outle
         if (val <= 0.0) {
             snprintf(out, outlen, "-inf dB");
         } else {
-            snprintf(out, outlen, "%+.1f dB", 60.0 * log10(val));
+            double db = 60.0 * log10(val);
+            /* Drop the sign at ~0dB -- "+0.0"/"-0.0" both just read as noise. */
+            if (fabs(db) < 0.05) snprintf(out, outlen, "0.0 dB");
+            else                 snprintf(out, outlen, "%+.1f dB", db);
         }
     } else {
         snprintf(out, outlen, "%d%%", (int)round(val * 100.0));
