@@ -416,7 +416,10 @@ static void populate_list(AppData *app) {
     gtk_widget_queue_draw(app->list_box);
 
     for (int i = 0; i < n_devices; i++) {
-        if (!app->show_all && devices[i].vol >= 0.995) continue;
+        /* "Active" means adjusted away from unity gain (100%/0dB) in either
+         * direction -- boost now goes up to 200%, so a device well above
+         * 100% is just as "active"/worth seeing as one below it. */
+        if (!app->show_all && fabs(devices[i].vol - 1.0) < 0.005) continue;
         char dname[MAX_NAME_LEN];
         display_name(devices[i].name, dname, sizeof(dname));
         char lvl[16];
@@ -556,17 +559,21 @@ static void on_inc5(GtkButton *btn, gpointer user_data) {
 
 /* ── Press-and-hold repeat for step buttons ──────────────────────────────── */
 /*
- * GtkButton has no built-in press-and-hold repeat, so this is done by hand
- * with a GtkGestureClick per button instead of "clicked": pressed fires one
- * step immediately (same feel as a plain click), then arms a one-shot
- * initial-delay timer; if still held when that fires, it starts a faster
- * periodic timer that keeps stepping until released/cancelled. Deliberately
- * replaces "clicked" rather than adding alongside it, since GtkButton always
- * emits "clicked" once on release regardless of hold duration -- keeping
- * both would double-count the last step of every hold. Trade-off: Tab+Space/
- * Enter keyboard activation no longer works on just these four buttons
- * (mouse/touch only) -- acceptable here since "hold to repeat" has no clean
- * keyboard equivalent anyway.
+ * GtkButton has no built-in press-and-hold repeat. First attempt used a
+ * separate GtkGestureClick added alongside GtkButton's own internal click
+ * gesture -- unreliable in practice (release didn't always stop the
+ * repeat), because GtkButton's own gesture can claim the pointer sequence
+ * and starve a second, externally-added gesture on the same widget of its
+ * "released"/"cancel" signals.
+ *
+ * Instead this watches the button's own "state-flags-changed" signal for
+ * GTK_STATE_FLAG_ACTIVE -- GtkButton already sets this exactly while
+ * physically pressed (mouse or keyboard) and clears it exactly on
+ * release/drag-off/cancel, so there's no second gesture competing for the
+ * same events; this is a passive observer of GtkButton's own already-
+ * correct state. Bonus over the gesture approach: keyboard Space/Enter
+ * activation still works (it toggles ACTIVE too), it just won't repeat
+ * from a single logical key-press the way holding the mouse button does.
  */
 
 #define REPEAT_INITIAL_DELAY_MS 400
@@ -599,46 +606,36 @@ static void start_repeat(AppData *app, StepActionFn action) {
     app->repeat_timeout_id = g_timeout_add(REPEAT_INITIAL_DELAY_MS, on_repeat_initial, app);
 }
 
-static void on_dec5_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
-    (void)g; (void)n_press; (void)x; (void)y;
+/* val is the widget's OLD state flags (the signal's own parameter); compare
+ * against its current flags to detect an ACTIVE transition in either
+ * direction. */
+static void on_dec5_state_changed(GtkWidget *btn, GtkStateFlags old_flags, gpointer user_data) {
     AppData *app = (AppData *)user_data;
-    on_dec5(NULL, app);
-    start_repeat(app, on_dec5);
+    gboolean active     = (gtk_widget_get_state_flags(btn) & GTK_STATE_FLAG_ACTIVE) != 0;
+    gboolean was_active = (old_flags & GTK_STATE_FLAG_ACTIVE) != 0;
+    if (active && !was_active)      { on_dec5(NULL, app); start_repeat(app, on_dec5); }
+    else if (!active && was_active) { stop_repeat(app); }
 }
-static void on_dec1_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
-    (void)g; (void)n_press; (void)x; (void)y;
+static void on_dec1_state_changed(GtkWidget *btn, GtkStateFlags old_flags, gpointer user_data) {
     AppData *app = (AppData *)user_data;
-    on_dec1(NULL, app);
-    start_repeat(app, on_dec1);
+    gboolean active     = (gtk_widget_get_state_flags(btn) & GTK_STATE_FLAG_ACTIVE) != 0;
+    gboolean was_active = (old_flags & GTK_STATE_FLAG_ACTIVE) != 0;
+    if (active && !was_active)      { on_dec1(NULL, app); start_repeat(app, on_dec1); }
+    else if (!active && was_active) { stop_repeat(app); }
 }
-static void on_inc1_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
-    (void)g; (void)n_press; (void)x; (void)y;
+static void on_inc1_state_changed(GtkWidget *btn, GtkStateFlags old_flags, gpointer user_data) {
     AppData *app = (AppData *)user_data;
-    on_inc1(NULL, app);
-    start_repeat(app, on_inc1);
+    gboolean active     = (gtk_widget_get_state_flags(btn) & GTK_STATE_FLAG_ACTIVE) != 0;
+    gboolean was_active = (old_flags & GTK_STATE_FLAG_ACTIVE) != 0;
+    if (active && !was_active)      { on_inc1(NULL, app); start_repeat(app, on_inc1); }
+    else if (!active && was_active) { stop_repeat(app); }
 }
-static void on_inc5_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
-    (void)g; (void)n_press; (void)x; (void)y;
+static void on_inc5_state_changed(GtkWidget *btn, GtkStateFlags old_flags, gpointer user_data) {
     AppData *app = (AppData *)user_data;
-    on_inc5(NULL, app);
-    start_repeat(app, on_inc5);
-}
-
-static void on_step_released(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
-    (void)g; (void)n_press; (void)x; (void)y;
-    stop_repeat((AppData *)user_data);
-}
-static void on_step_cancel(GtkGesture *g, GdkEventSequence *seq, gpointer user_data) {
-    (void)g; (void)seq;
-    stop_repeat((AppData *)user_data);
-}
-
-static void attach_step_repeat(GtkWidget *btn, AppData *app, GCallback pressed_cb) {
-    GtkGesture *gesture = gtk_gesture_click_new();
-    gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(gesture));
-    g_signal_connect(gesture, "pressed",  pressed_cb, app);
-    g_signal_connect(gesture, "released", G_CALLBACK(on_step_released), app);
-    g_signal_connect(gesture, "cancel",   G_CALLBACK(on_step_cancel), app);
+    gboolean active     = (gtk_widget_get_state_flags(btn) & GTK_STATE_FLAG_ACTIVE) != 0;
+    gboolean was_active = (old_flags & GTK_STATE_FLAG_ACTIVE) != 0;
+    if (active && !was_active)      { on_inc5(NULL, app); start_repeat(app, on_inc5); }
+    else if (!active && was_active) { stop_repeat(app); }
 }
 
 static void update_step_button_tooltips(AppData *app) {
@@ -692,8 +689,9 @@ static void on_toggle_show_all(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
     app->show_all = !app->show_all;
+    /* Label reads as the CURRENT mode, matching mode_toggle_btn's convention. */
     gtk_button_set_label(GTK_BUTTON(app->toggle_btn),
-        app->show_all ? "Show active only" : "Show all devices");
+        app->show_all ? "Showing All" : "Active Only");
     populate_list(app);
     update_right_panel(app, -1);
 }
@@ -934,7 +932,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     AppData *app = g_new0(AppData, 1);
-    app->show_all          = FALSE;
+    app->show_all          = TRUE;
     app->db_mode           = FALSE;
     app->unsaved           = FALSE;
     app->repeat_timeout_id = 0;
@@ -991,8 +989,10 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_hexpand(toolbar_spacer, TRUE);
     gtk_box_append(GTK_BOX(toolbar), toolbar_spacer);
 
-    app->toggle_btn = gtk_button_new_with_label("Show all devices");
+    app->toggle_btn = gtk_button_new_with_label("Showing All");
     gtk_widget_add_css_class(app->toggle_btn, "btn-toolbar");
+    gtk_widget_set_tooltip_text(app->toggle_btn,
+        "Click to filter to devices not at 100%/0dB");
     gtk_box_append(GTK_BOX(toolbar), app->toggle_btn);
     g_signal_connect(app->toggle_btn, "clicked",
         G_CALLBACK(on_toggle_show_all), app);
@@ -1076,28 +1076,28 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_sensitive(app->btn_dec5, FALSE);
     gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 5%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_dec5);
-    attach_step_repeat(app->btn_dec5, app, G_CALLBACK(on_dec5_pressed));
+    g_signal_connect(app->btn_dec5, "state-flags-changed", G_CALLBACK(on_dec5_state_changed), app);
 
     app->btn_dec1 = gtk_button_new_with_label("−");
     gtk_widget_add_css_class(app->btn_dec1, "btn-step");
     gtk_widget_set_sensitive(app->btn_dec1, FALSE);
     gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 1%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_dec1);
-    attach_step_repeat(app->btn_dec1, app, G_CALLBACK(on_dec1_pressed));
+    g_signal_connect(app->btn_dec1, "state-flags-changed", G_CALLBACK(on_dec1_state_changed), app);
 
     app->btn_inc1 = gtk_button_new_with_label("+");
     gtk_widget_add_css_class(app->btn_inc1, "btn-step");
     gtk_widget_set_sensitive(app->btn_inc1, FALSE);
     gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 1%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_inc1);
-    attach_step_repeat(app->btn_inc1, app, G_CALLBACK(on_inc1_pressed));
+    g_signal_connect(app->btn_inc1, "state-flags-changed", G_CALLBACK(on_inc1_state_changed), app);
 
     app->btn_inc5 = gtk_button_new_with_label("+ +");
     gtk_widget_add_css_class(app->btn_inc5, "btn-step");
     gtk_widget_set_sensitive(app->btn_inc5, FALSE);
     gtk_widget_set_tooltip_text(app->btn_inc5, "Increase 5%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_inc5);
-    attach_step_repeat(app->btn_inc5, app, G_CALLBACK(on_inc5_pressed));
+    g_signal_connect(app->btn_inc5, "state-flags-changed", G_CALLBACK(on_inc5_state_changed), app);
 
     GtkWidget *spacer_bot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_vexpand(spacer_bot, TRUE);
