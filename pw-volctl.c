@@ -53,6 +53,8 @@ static char   default_dir[256];
 
 /* ── Application state ───────────────────────────────────────────────────── */
 
+typedef void (*StepActionFn)(GtkButton *btn, gpointer user_data);
+
 typedef struct {
     GtkWidget *window;
     GtkWidget *list_box;
@@ -68,9 +70,11 @@ typedef struct {
     GtkWidget *revert_btn;
     GtkWidget *lbl_file;
     GtkWidget *status_lbl;
-    gboolean   show_all;
-    gboolean   db_mode;
-    gboolean   unsaved;
+    gboolean      show_all;
+    gboolean      db_mode;
+    gboolean      unsaved;
+    guint         repeat_timeout_id;   /* 0 = no press-and-hold repeat active */
+    StepActionFn  repeat_action;
     int        selected_idx;
     char       current_file[512];
 } AppData;
@@ -550,6 +554,93 @@ static void on_inc5(GtkButton *btn, gpointer user_data) {
     else              adjust_volume(app, PCT_STEP_LARGE);
 }
 
+/* ── Press-and-hold repeat for step buttons ──────────────────────────────── */
+/*
+ * GtkButton has no built-in press-and-hold repeat, so this is done by hand
+ * with a GtkGestureClick per button instead of "clicked": pressed fires one
+ * step immediately (same feel as a plain click), then arms a one-shot
+ * initial-delay timer; if still held when that fires, it starts a faster
+ * periodic timer that keeps stepping until released/cancelled. Deliberately
+ * replaces "clicked" rather than adding alongside it, since GtkButton always
+ * emits "clicked" once on release regardless of hold duration -- keeping
+ * both would double-count the last step of every hold. Trade-off: Tab+Space/
+ * Enter keyboard activation no longer works on just these four buttons
+ * (mouse/touch only) -- acceptable here since "hold to repeat" has no clean
+ * keyboard equivalent anyway.
+ */
+
+#define REPEAT_INITIAL_DELAY_MS 400
+#define REPEAT_INTERVAL_MS       80
+
+static void stop_repeat(AppData *app) {
+    if (app->repeat_timeout_id) {
+        g_source_remove(app->repeat_timeout_id);
+        app->repeat_timeout_id = 0;
+    }
+    app->repeat_action = NULL;
+}
+
+static gboolean on_repeat_tick(gpointer user_data) {
+    AppData *app = (AppData *)user_data;
+    if (app->repeat_action) app->repeat_action(NULL, app);
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean on_repeat_initial(gpointer user_data) {
+    AppData *app = (AppData *)user_data;
+    app->repeat_timeout_id = g_timeout_add(REPEAT_INTERVAL_MS, on_repeat_tick, app);
+    if (app->repeat_action) app->repeat_action(NULL, app);
+    return G_SOURCE_REMOVE;
+}
+
+static void start_repeat(AppData *app, StepActionFn action) {
+    stop_repeat(app);
+    app->repeat_action = action;
+    app->repeat_timeout_id = g_timeout_add(REPEAT_INITIAL_DELAY_MS, on_repeat_initial, app);
+}
+
+static void on_dec5_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)g; (void)n_press; (void)x; (void)y;
+    AppData *app = (AppData *)user_data;
+    on_dec5(NULL, app);
+    start_repeat(app, on_dec5);
+}
+static void on_dec1_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)g; (void)n_press; (void)x; (void)y;
+    AppData *app = (AppData *)user_data;
+    on_dec1(NULL, app);
+    start_repeat(app, on_dec1);
+}
+static void on_inc1_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)g; (void)n_press; (void)x; (void)y;
+    AppData *app = (AppData *)user_data;
+    on_inc1(NULL, app);
+    start_repeat(app, on_inc1);
+}
+static void on_inc5_pressed(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)g; (void)n_press; (void)x; (void)y;
+    AppData *app = (AppData *)user_data;
+    on_inc5(NULL, app);
+    start_repeat(app, on_inc5);
+}
+
+static void on_step_released(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user_data) {
+    (void)g; (void)n_press; (void)x; (void)y;
+    stop_repeat((AppData *)user_data);
+}
+static void on_step_cancel(GtkGesture *g, GdkEventSequence *seq, gpointer user_data) {
+    (void)g; (void)seq;
+    stop_repeat((AppData *)user_data);
+}
+
+static void attach_step_repeat(GtkWidget *btn, AppData *app, GCallback pressed_cb) {
+    GtkGesture *gesture = gtk_gesture_click_new();
+    gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(gesture));
+    g_signal_connect(gesture, "pressed",  pressed_cb, app);
+    g_signal_connect(gesture, "released", G_CALLBACK(on_step_released), app);
+    g_signal_connect(gesture, "cancel",   G_CALLBACK(on_step_cancel), app);
+}
+
 static void update_step_button_tooltips(AppData *app) {
     if (app->db_mode) {
         gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 3 dB");
@@ -843,9 +934,11 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     AppData *app = g_new0(AppData, 1);
-    app->show_all        = FALSE;
-    app->db_mode         = FALSE;
-    app->unsaved         = FALSE;
+    app->show_all          = FALSE;
+    app->db_mode           = FALSE;
+    app->unsaved           = FALSE;
+    app->repeat_timeout_id = 0;
+    app->repeat_action     = NULL;
     app->selected_idx    = -1;
     app->current_file[0] = '\0';
     app->lbl_file        = NULL;   /* created during widget build */
@@ -983,28 +1076,28 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_sensitive(app->btn_dec5, FALSE);
     gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 5%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_dec5);
-    g_signal_connect(app->btn_dec5, "clicked", G_CALLBACK(on_dec5), app);
+    attach_step_repeat(app->btn_dec5, app, G_CALLBACK(on_dec5_pressed));
 
     app->btn_dec1 = gtk_button_new_with_label("−");
     gtk_widget_add_css_class(app->btn_dec1, "btn-step");
     gtk_widget_set_sensitive(app->btn_dec1, FALSE);
     gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 1%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_dec1);
-    g_signal_connect(app->btn_dec1, "clicked", G_CALLBACK(on_dec1), app);
+    attach_step_repeat(app->btn_dec1, app, G_CALLBACK(on_dec1_pressed));
 
     app->btn_inc1 = gtk_button_new_with_label("+");
     gtk_widget_add_css_class(app->btn_inc1, "btn-step");
     gtk_widget_set_sensitive(app->btn_inc1, FALSE);
     gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 1%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_inc1);
-    g_signal_connect(app->btn_inc1, "clicked", G_CALLBACK(on_inc1), app);
+    attach_step_repeat(app->btn_inc1, app, G_CALLBACK(on_inc1_pressed));
 
     app->btn_inc5 = gtk_button_new_with_label("+ +");
     gtk_widget_add_css_class(app->btn_inc5, "btn-step");
     gtk_widget_set_sensitive(app->btn_inc5, FALSE);
     gtk_widget_set_tooltip_text(app->btn_inc5, "Increase 5%");
     gtk_box_append(GTK_BOX(step_hbox), app->btn_inc5);
-    g_signal_connect(app->btn_inc5, "clicked", G_CALLBACK(on_inc5), app);
+    attach_step_repeat(app->btn_inc5, app, G_CALLBACK(on_inc5_pressed));
 
     GtkWidget *spacer_bot = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_vexpand(spacer_bot, TRUE);
