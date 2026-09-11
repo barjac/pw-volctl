@@ -8,7 +8,7 @@
  * Save / Load use a file chooser for named presets.
  *
  * Build:
- *   gcc $(pkg-config --cflags gtk4) -o pw-volctl pw-volctl.c $(pkg-config --libs gtk4)
+ *   gcc $(pkg-config --cflags gtk4 libpulse libpulse-mainloop-glib) -o pw-volctl pw-volctl.c $(pkg-config --libs gtk4 libpulse libpulse-mainloop-glib) -lm
  */
 
 #include <gtk/gtk.h>
@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pulse/pulseaudio.h>
+#include <pulse/glib-mainloop.h>
 
 #define MAX_DEVICES    64
 #define MAX_NAME_LEN  128
@@ -29,6 +31,14 @@
 #define PCT_STEP_LARGE 0.05
 #define DB_STEP_SMALL  0.1
 #define DB_STEP_LARGE  3.0
+
+/* dBFS level that maps to 100% on the live level meter's display. Not true
+ * 0dBFS -- normal listening rarely peaks anywhere near true full scale, so
+ * leaving the meter calibrated to true 0dBFS wastes most of its visible
+ * range. Display-only: app->level_peak itself stays the true, unscaled
+ * peak; this is applied at draw time. Empirically tunable by eye/ear if
+ * this value doesn't feel right, same as freedv-gui's own level meter. */
+#define LEVEL_METER_REFERENCE_DB (-6.0f)
 
 /* ── Data model ─────────────────────────────────────────────────────────── */
 
@@ -70,6 +80,7 @@ typedef struct {
     GtkWidget *revert_btn;
     GtkWidget *lbl_file;
     GtkWidget *status_lbl;
+    GtkWidget *level_meter;             /* GtkDrawingArea, live peak for the selected device */
     gboolean      show_all;
     gboolean      db_mode;
     gboolean      unsaved;
@@ -77,6 +88,11 @@ typedef struct {
     StepActionFn  repeat_action;
     int        selected_idx;
     char       current_file[512];
+    pa_glib_mainloop *pa_gmainloop;
+    pa_context        *pa_ctx;
+    gboolean           pa_ready;       /* pa_ctx has reached PA_CONTEXT_READY */
+    pa_stream         *level_stream;   /* NULL when not monitoring any device */
+    float              level_peak;     /* 0.0-1.0, most recent peak from level_stream */
 } AppData;
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
@@ -93,6 +109,9 @@ static void  write_last_file(const char *path);
 static void  take_snapshot(void);
 static void  restore_snapshot(void);
 static void  format_level_label(AppData *app, double val, char *out, size_t outlen);
+static void  pa_init(AppData *app);
+static void  update_level_monitor(AppData *app, int idx);
+static void  stop_level_monitor(AppData *app);
 static void  set_volume(AppData *app, double val);
 static void  adjust_volume(AppData *app, double delta);
 static void  adjust_volume_db(AppData *app, double delta_db);
@@ -442,6 +461,160 @@ static void populate_list(AppData *app) {
     }
 }
 
+/* ── Live level meter (libpulse peak-detect, via pipewire-pulse) ────────── */
+/*
+ * wpctl has no live peak/signal query, only the configured volume -- so
+ * this uses the same mechanism pavucontrol/GNOME/KDE's own volume meters
+ * use: a PulseAudio recording stream in PA_STREAM_PEAK_DETECT mode, which
+ * PipeWire's pipewire-pulse compatibility layer serves transparently (no
+ * separate PulseAudio daemon needed). Integrated with GTK's main loop via
+ * pa_glib_mainloop, so callbacks land safely on the main thread -- no
+ * locking needed to touch AppData/GTK widgets from them.
+ *
+ * Monitor target: PipeWire exposes every sink's output as "<name>.monitor"
+ * on the pulse-compat layer (confirmed live via `pactl list sources
+ * short`), while a source's own name is already the recordable target --
+ * so branch on media.class ("Audio/Sink" vs "Audio/Source", confirmed via
+ * `wpctl inspect`) to build the right one.
+ */
+
+static void stop_level_monitor(AppData *app) {
+    if (app->level_stream) {
+        /* Detach callbacks BEFORE disconnect/unref: if the underlying
+         * pa_stream outlives our reference for any reason (async disconnect
+         * timing, or pa_context holding its own internal reference), its
+         * read callback would otherwise keep firing into this (by-then-
+         * stale-for-this-device) app->level_peak indefinitely -- observed
+         * live as the meter tracking a previously-selected device's audio
+         * (e.g. a Bluetooth sink something else was playing through)
+         * regardless of what's newly selected. */
+        pa_stream_set_read_callback(app->level_stream, NULL, NULL);
+        pa_stream_set_state_callback(app->level_stream, NULL, NULL);
+        pa_stream_disconnect(app->level_stream);
+        pa_stream_unref(app->level_stream);
+        app->level_stream = NULL;
+    }
+    app->level_peak = 0.0f;
+    if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+}
+
+static void on_level_stream_read(pa_stream *s, size_t length, void *userdata) {
+    AppData *app = (AppData *)userdata;
+    const void *data;
+    if (pa_stream_peek(s, &data, &length) < 0 || !data || length == 0) {
+        /* A NULL data pointer with length>0 means a hole in the stream --
+         * nothing to read, just skip it. */
+        if (length > 0) pa_stream_drop(s);
+        return;
+    }
+    const float *samples = (const float *)data;
+    size_t n = length / sizeof(float);
+    float peak = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        float v = fabsf(samples[i]);
+        if (v > peak) peak = v;
+    }
+    pa_stream_drop(s);
+
+    /* The monitor tap is pre-fader (before this node's own volume is
+     * applied), confirmed live 2026-09-11 -- turning the volume down to
+     * 0% audibly silenced the device but the raw peak kept moving. Correct
+     * for it here so the meter tracks what's actually audible: WirePlumber
+     * applies a cubic volume curve (gain = vol^3, not vol directly --
+     * confirmed empirically against real AGC data in the freedv-gui work,
+     * see the app's own vol field being the raw linear fraction passed
+     * straight to `wpctl set-volume`), so scale the raw peak by that same
+     * curve using the currently selected device's own vol.
+     */
+    float gain = 1.0f;
+    if (app->selected_idx >= 0) {
+        float vol = (float)devices[app->selected_idx].vol;
+        gain = vol * vol * vol;
+    }
+    app->level_peak = peak * gain;
+    if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+}
+
+static void on_level_stream_state(pa_stream *s, void *userdata) {
+    AppData *app = (AppData *)userdata;
+    switch (pa_stream_get_state(s)) {
+        case PA_STREAM_FAILED:
+        case PA_STREAM_TERMINATED:
+            /* Not every node is recordable (e.g. some virtual/stream-only
+             * nodes) -- just leave the meter at 0 rather than erroring. */
+            if (app->level_stream == s) stop_level_monitor(app);
+            break;
+        default:
+            break;
+    }
+}
+
+static void start_level_monitor(AppData *app, const char *pulse_device_name) {
+    stop_level_monitor(app);
+    if (!app->pa_ready || !app->pa_ctx) return;
+
+    pa_sample_spec ss = { .format = PA_SAMPLE_FLOAT32LE, .rate = 44100, .channels = 1 };
+    pa_stream *s = pa_stream_new(app->pa_ctx, "pw-volctl level meter", &ss, NULL);
+    if (!s) return;
+
+    pa_stream_set_read_callback(s, on_level_stream_read, app);
+    pa_stream_set_state_callback(s, on_level_stream_state, app);
+
+    pa_buffer_attr attr = { .maxlength = (uint32_t)-1, .fragsize = 512 };
+    pa_stream_flags_t flags = PA_STREAM_ADJUST_LATENCY | PA_STREAM_PEAK_DETECT;
+    if (pa_stream_connect_record(s, pulse_device_name, &attr, flags) < 0) {
+        pa_stream_unref(s);
+        return;
+    }
+    app->level_stream = s;
+}
+
+static void update_level_monitor(AppData *app, int idx) {
+    if (idx < 0) { stop_level_monitor(app); return; }
+    Device *d = &devices[idx];
+    char target[MAX_NAME_LEN + 16];
+    if (strstr(d->class, "Sink")) snprintf(target, sizeof(target), "%s.monitor", d->name);
+    else                          snprintf(target, sizeof(target), "%s", d->name);
+    start_level_monitor(app, target);
+}
+
+static void on_level_meter_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+    (void)area;
+    AppData *app = (AppData *)user_data;
+    cairo_set_source_rgb(cr, 0.11, 0.14, 0.17);
+    cairo_paint(cr);
+    float frac = app->level_peak / powf(10.0f, LEVEL_METER_REFERENCE_DB / 20.0f);
+    if (frac > 1.0f) frac = 1.0f;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 0.0f) {
+        cairo_set_source_rgb(cr, 0.0, 0.78, 0.0);
+        cairo_rectangle(cr, 0, 0, width * frac, height);
+        cairo_fill(cr);
+    }
+}
+
+static void on_pa_context_state(pa_context *c, void *userdata) {
+    AppData *app = (AppData *)userdata;
+    pa_context_state_t state = pa_context_get_state(c);
+    if (state == PA_CONTEXT_READY) {
+        app->pa_ready = TRUE;
+        /* A device may already be selected from before the context finished
+         * connecting -- start monitoring it now. */
+        update_level_monitor(app, app->selected_idx);
+    } else if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED) {
+        app->pa_ready = FALSE;
+    }
+}
+
+static void pa_init(AppData *app) {
+    app->pa_gmainloop = pa_glib_mainloop_new(NULL);
+    pa_mainloop_api *api = pa_glib_mainloop_get_api(app->pa_gmainloop);
+    app->pa_ctx = pa_context_new(api, "pw-volctl");
+    app->pa_ready = FALSE;
+    pa_context_set_state_callback(app->pa_ctx, on_pa_context_state, app);
+    pa_context_connect(app->pa_ctx, NULL, PA_CONTEXT_NOFLAGS, NULL);
+}
+
 static void update_right_panel(AppData *app, int idx) {
     app->selected_idx = idx;
     if (idx < 0) {
@@ -449,6 +622,7 @@ static void update_right_panel(AppData *app, int idx) {
         gtk_label_set_text(GTK_LABEL(app->lbl_class), "");
         gtk_label_set_text(GTK_LABEL(app->lbl_pct),   "");
         set_step_buttons_sensitive(app, FALSE);
+        update_level_monitor(app, -1);
         return;
     }
     Device *d = &devices[idx];
@@ -461,6 +635,7 @@ static void update_right_panel(AppData *app, int idx) {
     gtk_label_set_text(GTK_LABEL(app->lbl_pct), pct);
 
     set_step_buttons_sensitive(app, TRUE);
+    update_level_monitor(app, idx);
 }
 
 /* ── Signal callbacks ────────────────────────────────────────────────────── */
@@ -956,7 +1131,10 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     app->selected_idx    = -1;
     app->current_file[0] = '\0';
     app->lbl_file        = NULL;   /* created during widget build */
+    app->level_stream    = NULL;
+    app->level_peak      = 0.0f;
 
+    pa_init(app);
     build_paths();
 
     /* Always start with live levels — no auto-load */
@@ -1076,6 +1254,14 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_add_css_class(app->lbl_pct, "pct-label");
     gtk_label_set_xalign(GTK_LABEL(app->lbl_pct), 0.0f);
     gtk_box_append(GTK_BOX(ctrl_vbox), app->lbl_pct);
+
+    /* ── Live level meter (real signal presence, not just configured volume) ── */
+    app->level_meter = gtk_drawing_area_new();
+    gtk_widget_set_size_request(app->level_meter, -1, 10);
+    gtk_widget_set_tooltip_text(app->level_meter, "Live signal level for the selected device");
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(app->level_meter),
+        on_level_meter_draw, app, NULL);
+    gtk_box_append(GTK_BOX(ctrl_vbox), app->level_meter);
 
     /* ── Step buttons: --  -  +  ++ ── */
     GtkWidget *step_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
