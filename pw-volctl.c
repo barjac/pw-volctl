@@ -24,6 +24,12 @@
 #define LAST_PATH     "%s/.config/pipewire/pw-volctl.last"
 #define DEFAULT_DIR   "%s/.config/pipewire"
 
+/* Step sizes for the four level buttons, in each stepping mode. */
+#define PCT_STEP_SMALL 0.01
+#define PCT_STEP_LARGE 0.05
+#define DB_STEP_SMALL  0.5
+#define DB_STEP_LARGE  3.0
+
 /* ── Data model ─────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -57,11 +63,13 @@ typedef struct {
     GtkWidget *btn_dec1;
     GtkWidget *btn_inc1;
     GtkWidget *btn_inc5;
+    GtkWidget *mode_toggle_btn;
     GtkWidget *toggle_btn;
     GtkWidget *revert_btn;
     GtkWidget *lbl_file;
     GtkWidget *status_lbl;
     gboolean   show_all;
+    gboolean   db_mode;
     gboolean   unsaved;
     int        selected_idx;
     char       current_file[512];
@@ -80,8 +88,11 @@ static void  set_current_file(AppData *app, const char *path);
 static void  write_last_file(const char *path);
 static void  take_snapshot(void);
 static void  restore_snapshot(void);
+static void  set_volume(AppData *app, double val);
 static void  adjust_volume(AppData *app, double delta);
+static void  adjust_volume_db(AppData *app, double delta_db);
 static void  set_step_buttons_sensitive(AppData *app, gboolean sensitive);
+static void  update_step_button_tooltips(AppData *app);
 
 /* ── Path helpers ────────────────────────────────────────────────────────── */
 
@@ -440,9 +451,17 @@ static void set_step_buttons_sensitive(AppData *app, gboolean sensitive) {
     gtk_widget_set_sensitive(app->btn_inc5, sensitive);
 }
 
-static void adjust_volume(AppData *app, double delta) {
+/*
+ * Common tail for both stepping modes: clamp, store, refresh the visible
+ * labels, apply live via wpctl, and persist. val is always the linear
+ * fraction that gets passed straight to `wpctl set-volume` -- WirePlumber
+ * applies its own cubic curve on top of that internally (see "Converting a
+ * dB Change to a Percentage" in pw-volctl-guide.md), so this is the same
+ * quantity the [%] label shows, regardless of which stepping mode produced
+ * the change.
+ */
+static void set_volume(AppData *app, double val) {
     if (app->selected_idx < 0) return;
-    double val = devices[app->selected_idx].vol + delta;
     if (val < 0.0) val = 0.0;
     if (val > 2.0) val = 2.0;
     devices[app->selected_idx].vol = val;
@@ -468,10 +487,70 @@ static void adjust_volume(AppData *app, double delta) {
     set_unsaved(app, TRUE);
 }
 
-static void on_dec5(GtkButton *btn, gpointer user_data) { (void)btn; adjust_volume((AppData *)user_data, -0.05); }
-static void on_dec1(GtkButton *btn, gpointer user_data) { (void)btn; adjust_volume((AppData *)user_data, -0.01); }
-static void on_inc1(GtkButton *btn, gpointer user_data) { (void)btn; adjust_volume((AppData *)user_data,  0.01); }
-static void on_inc5(GtkButton *btn, gpointer user_data) { (void)btn; adjust_volume((AppData *)user_data,  0.05); }
+/* %-mode step: delta is a fraction added directly to vol (0.01 = 1%). */
+static void adjust_volume(AppData *app, double delta) {
+    if (app->selected_idx < 0) return;
+    set_volume(app, devices[app->selected_idx].vol + delta);
+}
+
+/*
+ * dB-mode step: since vol follows WirePlumber's cubic curve
+ * (dB = 60*log10(vol)), a dB change is multiplicative on vol, not additive
+ * like the %-mode step above.
+ */
+static void adjust_volume_db(AppData *app, double delta_db) {
+    if (app->selected_idx < 0) return;
+    double old_val = devices[app->selected_idx].vol;
+    set_volume(app, old_val * pow(10.0, delta_db / 60.0));
+}
+
+static void on_dec5(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppData *app = (AppData *)user_data;
+    if (app->db_mode) adjust_volume_db(app, -DB_STEP_LARGE);
+    else              adjust_volume(app, -PCT_STEP_LARGE);
+}
+static void on_dec1(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppData *app = (AppData *)user_data;
+    if (app->db_mode) adjust_volume_db(app, -DB_STEP_SMALL);
+    else              adjust_volume(app, -PCT_STEP_SMALL);
+}
+static void on_inc1(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppData *app = (AppData *)user_data;
+    if (app->db_mode) adjust_volume_db(app, DB_STEP_SMALL);
+    else              adjust_volume(app, PCT_STEP_SMALL);
+}
+static void on_inc5(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppData *app = (AppData *)user_data;
+    if (app->db_mode) adjust_volume_db(app, DB_STEP_LARGE);
+    else              adjust_volume(app, PCT_STEP_LARGE);
+}
+
+static void update_step_button_tooltips(AppData *app) {
+    if (app->db_mode) {
+        gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 3 dB");
+        gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 0.5 dB");
+        gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 0.5 dB");
+        gtk_widget_set_tooltip_text(app->btn_inc5, "Increase 3 dB");
+    } else {
+        gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 5%");
+        gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 1%");
+        gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 1%");
+        gtk_widget_set_tooltip_text(app->btn_inc5, "Increase 5%");
+    }
+}
+
+static void on_toggle_mode(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    AppData *app = (AppData *)user_data;
+    app->db_mode = !app->db_mode;
+    gtk_button_set_label(GTK_BUTTON(app->mode_toggle_btn),
+        app->db_mode ? "dB steps" : "% steps");
+    update_step_button_tooltips(app);
+}
 
 static void on_toggle_show_all(GtkButton *btn, gpointer user_data) {
     (void)btn;
@@ -720,6 +799,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     AppData *app = g_new0(AppData, 1);
     app->show_all        = FALSE;
+    app->db_mode         = FALSE;
     app->unsaved         = FALSE;
     app->selected_idx    = -1;
     app->current_file[0] = '\0';
@@ -845,6 +925,13 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     GtkWidget *step_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(step_hbox, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(ctrl_vbox), step_hbox);
+
+    app->mode_toggle_btn = gtk_button_new_with_label("% steps");
+    gtk_widget_add_css_class(app->mode_toggle_btn, "btn-toolbar");
+    gtk_widget_set_tooltip_text(app->mode_toggle_btn,
+        "Toggle step buttons between %/dB");
+    gtk_box_append(GTK_BOX(step_hbox), app->mode_toggle_btn);
+    g_signal_connect(app->mode_toggle_btn, "clicked", G_CALLBACK(on_toggle_mode), app);
 
     app->btn_dec5 = gtk_button_new_with_label("− −");
     gtk_widget_add_css_class(app->btn_dec5, "btn-step");
