@@ -88,6 +88,7 @@ static void  set_current_file(AppData *app, const char *path);
 static void  write_last_file(const char *path);
 static void  take_snapshot(void);
 static void  restore_snapshot(void);
+static void  format_level_label(AppData *app, double val, char *out, size_t outlen);
 static void  set_volume(AppData *app, double val);
 static void  adjust_volume(AppData *app, double delta);
 static void  adjust_volume_db(AppData *app, double delta_db);
@@ -373,6 +374,25 @@ static void apply_all_volumes(void) {
 /* ── GUI helpers ─────────────────────────────────────────────────────────── */
 
 /*
+ * Formats a volume fraction as either "NN%" or "+N.N dB"/"-N.N dB", per the
+ * current stepping mode -- so switching the mode toggle changes what's
+ * actually displayed, not just the step size. dB is relative to vol=1.0
+ * (unity gain, 0 dB), matching the wpctl fraction directly, per the
+ * "Converting a dB Change to a Percentage" section of pw-volctl-guide.md.
+ */
+static void format_level_label(AppData *app, double val, char *out, size_t outlen) {
+    if (app->db_mode) {
+        if (val <= 0.0) {
+            snprintf(out, outlen, "-inf dB");
+        } else {
+            snprintf(out, outlen, "%+.1f dB", 60.0 * log10(val));
+        }
+    } else {
+        snprintf(out, outlen, "%d%%", (int)round(val * 100.0));
+    }
+}
+
+/*
  * Revert is only enabled when a file is loaded and there are unsaved changes.
  * Save is always available.
  */
@@ -395,9 +415,10 @@ static void populate_list(AppData *app) {
         if (!app->show_all && devices[i].vol >= 0.995) continue;
         char dname[MAX_NAME_LEN];
         display_name(devices[i].name, dname, sizeof(dname));
+        char lvl[16];
+        format_level_label(app, devices[i].vol, lvl, sizeof(lvl));
         char label[256];
-        snprintf(label, sizeof(label), "%s  [%d%%]",
-                 dname, (int)round(devices[i].vol * 100.0));
+        snprintf(label, sizeof(label), "%s  [%s]", dname, lvl);
         GtkWidget *row_lbl = gtk_label_new(label);
         gtk_label_set_xalign(GTK_LABEL(row_lbl), 0.0f);
         gtk_widget_set_margin_start(row_lbl, 8);
@@ -426,7 +447,7 @@ static void update_right_panel(AppData *app, int idx) {
     gtk_label_set_text(GTK_LABEL(app->lbl_name),  dname);
     gtk_label_set_text(GTK_LABEL(app->lbl_class), d->class);
     char pct[16];
-    snprintf(pct, sizeof(pct), "%d%%", (int)round(d->vol * 100.0));
+    format_level_label(app, d->vol, pct, sizeof(pct));
     gtk_label_set_text(GTK_LABEL(app->lbl_pct), pct);
 
     set_step_buttons_sensitive(app, TRUE);
@@ -466,9 +487,9 @@ static void set_volume(AppData *app, double val) {
     if (val > 2.0) val = 2.0;
     devices[app->selected_idx].vol = val;
 
-    /* Update percentage label */
+    /* Update level label */
     char pct[16];
-    snprintf(pct, sizeof(pct), "%d%%", (int)round(val * 100.0));
+    format_level_label(app, val, pct, sizeof(pct));
     gtk_label_set_text(GTK_LABEL(app->lbl_pct), pct);
 
     /* Update list row label */
@@ -478,7 +499,7 @@ static void set_volume(AppData *app, double val) {
         char dname[MAX_NAME_LEN];
         display_name(devices[app->selected_idx].name, dname, sizeof(dname));
         char label[256];
-        snprintf(label, sizeof(label), "%s  [%d%%]", dname, (int)round(val * 100.0));
+        snprintf(label, sizeof(label), "%s  [%s]", dname, pct);
         gtk_label_set_text(GTK_LABEL(lbl), label);
     }
 
@@ -547,9 +568,33 @@ static void on_toggle_mode(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
     app->db_mode = !app->db_mode;
+    /* Label reads as the CURRENT mode, not the action a click performs. */
     gtk_button_set_label(GTK_BUTTON(app->mode_toggle_btn),
-        app->db_mode ? "dB steps" : "% steps");
+        app->db_mode ? "Mode: dB" : "Mode: %");
     update_step_button_tooltips(app);
+
+    /* Re-render every visible level in the new mode's units immediately,
+     * not just after the next step button press. populate_list() rebuilds
+     * the list from scratch, which drops the row selection (same reason
+     * on_revert() below has to manually re-find and reselect afterward) --
+     * so capture and restore it here too. */
+    int prev_idx = app->selected_idx;
+    populate_list(app);
+    gboolean reselected = FALSE;
+    if (prev_idx >= 0) {
+        GtkListBoxRow *row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(app->list_box), 0);
+        while (row) {
+            int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "device-idx"));
+            if (idx == prev_idx) {
+                gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
+                update_right_panel(app, prev_idx);
+                reselected = TRUE;
+                break;
+            }
+            row = GTK_LIST_BOX_ROW(gtk_widget_get_next_sibling(GTK_WIDGET(row)));
+        }
+    }
+    if (!reselected) update_right_panel(app, -1);
 }
 
 static void on_toggle_show_all(GtkButton *btn, gpointer user_data) {
@@ -926,10 +971,10 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_halign(step_hbox, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(ctrl_vbox), step_hbox);
 
-    app->mode_toggle_btn = gtk_button_new_with_label("% steps");
+    app->mode_toggle_btn = gtk_button_new_with_label("Mode: %");
     gtk_widget_add_css_class(app->mode_toggle_btn, "btn-toolbar");
     gtk_widget_set_tooltip_text(app->mode_toggle_btn,
-        "Toggle step buttons between %/dB");
+        "Click to switch level display/stepping between % and dB");
     gtk_box_append(GTK_BOX(step_hbox), app->mode_toggle_btn);
     g_signal_connect(app->mode_toggle_btn, "clicked", G_CALLBACK(on_toggle_mode), app);
 
