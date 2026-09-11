@@ -117,6 +117,40 @@ asked whether you really want to close. Choose:
 
 ---
 
+## Converting a dB Change to a Percentage
+
+The percentage shown for each device isn't a straight (linear) fraction of full
+volume — it follows the same curve PulseAudio-style volume sliders use, so a
+given percentage step means a different dB change depending on where you start.
+
+```
+percent = 100 x 10^(dB / 60)
+dB      = 60 x log10(percent / 100)
+```
+
+100% is always 0 dB (unity gain). Some reference points:
+
+| dB change | Percentage |
+|---|---|
+| 0 dB | 100% |
+| −6 dB | 79% |
+| −10 dB | 68% |
+| −18 dB | 50% |
+| −20 dB | 46% |
+| −30 dB | 32% |
+| −40 dB | 22% |
+| −60 dB | 10% |
+
+> **Note:** the same percentage-point step is a much bigger dB change lower
+> down the scale than near 100% — e.g. a −5% adjustment near 100% is only
+> about −1.3 dB, but the same −5% near 50% is about −2.8 dB. If you're
+> adjusting two pw-volctl-controlled stages in series to hit a known dB
+> change, it pays to park one control at a round percentage (ideally 100%,
+> where the table above is exact) and do the fine adjustment entirely on the
+> other, rather than adding up two curved conversions in your head.
+
+---
+
 ## File Location
 
 Preset files can be stored anywhere, but by default the file chooser opens in:
