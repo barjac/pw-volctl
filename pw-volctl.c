@@ -444,7 +444,7 @@ static void adjust_volume(AppData *app, double delta) {
     if (app->selected_idx < 0) return;
     double val = devices[app->selected_idx].vol + delta;
     if (val < 0.0) val = 0.0;
-    if (val > 1.0) val = 1.0;
+    if (val > 2.0) val = 2.0;
     devices[app->selected_idx].vol = val;
 
     /* Update percentage label */
