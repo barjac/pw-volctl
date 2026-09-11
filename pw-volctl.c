@@ -27,7 +27,7 @@
 /* Step sizes for the four level buttons, in each stepping mode. */
 #define PCT_STEP_SMALL 0.01
 #define PCT_STEP_LARGE 0.05
-#define DB_STEP_SMALL  0.5
+#define DB_STEP_SMALL  0.1
 #define DB_STEP_LARGE  3.0
 
 /* ── Data model ─────────────────────────────────────────────────────────── */
@@ -553,8 +553,8 @@ static void on_inc5(GtkButton *btn, gpointer user_data) {
 static void update_step_button_tooltips(AppData *app) {
     if (app->db_mode) {
         gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 3 dB");
-        gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 0.5 dB");
-        gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 0.5 dB");
+        gtk_widget_set_tooltip_text(app->btn_dec1, "Decrease 0.1 dB");
+        gtk_widget_set_tooltip_text(app->btn_inc1, "Increase 0.1 dB");
         gtk_widget_set_tooltip_text(app->btn_inc5, "Increase 3 dB");
     } else {
         gtk_widget_set_tooltip_text(app->btn_dec5, "Decrease 5%");
