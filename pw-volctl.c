@@ -110,6 +110,8 @@ static void  take_snapshot(void);
 static void  restore_snapshot(void);
 static void  format_level_label(AppData *app, double val, char *out, size_t outlen);
 static void  pa_init(AppData *app);
+static void  pa_connect(AppData *app);
+static gboolean pa_reconnect_timeout(gpointer user_data);
 static void  update_level_monitor(AppData *app, int idx);
 static void  stop_level_monitor(AppData *app);
 static void  set_volume(AppData *app, double val);
@@ -331,8 +333,20 @@ static void save_temp(void) { write_file(temp_path); }
 
 static int get_wpctl_id(int idx) {
     if (idx < 0 || idx >= n_devices) return -1;
-    if (devices[idx].wpctl_id >= 0) return devices[idx].wpctl_id;
 
+    // Deliberately no "if already resolved, trust the cache" shortcut here
+    // (removed 2026-09-19) -- freedv-start-diag runs `systemctl --user
+    // restart pipewire wireplumber` on every launch, which destroys and
+    // recreates every PipeWire object including FDV_TX_in with a brand-new
+    // numeric ID each time. A cached ID from an earlier FreeDV session
+    // silently goes stale, and every subsequent `wpctl set-volume` targets
+    // an ID that no longer exists (or, worse, could now belong to a
+    // different node entirely) -- the real, current device is never
+    // touched. Observed live: setting a new level for FDV_TX_in after a
+    // FreeDV restart kept applying to "the old one from the previous run."
+    // Re-resolving by name+class on every call is cheap (this only runs on
+    // user-initiated slider/button actions, not per-frame) and eliminates
+    // the whole class of staleness bug.
     FILE *fp = popen("wpctl status", "r");
     if (!fp) return -1;
     int ids[256]; int n_ids = 0;
@@ -480,19 +494,24 @@ static void populate_list(AppData *app) {
 
 static void stop_level_monitor(AppData *app) {
     if (app->level_stream) {
-        /* Detach callbacks BEFORE disconnect/unref: if the underlying
-         * pa_stream outlives our reference for any reason (async disconnect
-         * timing, or pa_context holding its own internal reference), its
-         * read callback would otherwise keep firing into this (by-then-
-         * stale-for-this-device) app->level_peak indefinitely -- observed
-         * live as the meter tracking a previously-selected device's audio
-         * (e.g. a Bluetooth sink something else was playing through)
-         * regardless of what's newly selected. */
-        pa_stream_set_read_callback(app->level_stream, NULL, NULL);
-        pa_stream_set_state_callback(app->level_stream, NULL, NULL);
-        pa_stream_disconnect(app->level_stream);
-        pa_stream_unref(app->level_stream);
-        app->level_stream = NULL;
+        pa_stream *s = app->level_stream;
+        app->level_stream = NULL; /* detach immediately so a new stream can
+                                     take over without waiting on this one */
+
+        /* Clear the read callback now (no longer interested in level data
+         * from a stream we're tearing down) but deliberately leave the
+         * state callback attached: on_level_stream_state() now owns
+         * finishing this stream's teardown (disconnect + unref) once the
+         * server actually confirms termination, rather than us unref'ing
+         * synchronously here right after requesting disconnect. Disconnect
+         * is asynchronous (pa_glib_mainloop flushes the request on a later
+         * mainloop iteration, not inline in this call), so unref'ing
+         * immediately risked the local object being freed before its
+         * disconnect request had actually reached the server -- observed
+         * live as multiple stale pw-volctl nodes left registered against
+         * the same monitor after quickly switching between devices. */
+        pa_stream_set_read_callback(s, NULL, NULL);
+        pa_stream_disconnect(s);
     }
     app->level_peak = 0.0f;
     if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
@@ -540,9 +559,22 @@ static void on_level_stream_state(pa_stream *s, void *userdata) {
     switch (pa_stream_get_state(s)) {
         case PA_STREAM_FAILED:
         case PA_STREAM_TERMINATED:
-            /* Not every node is recordable (e.g. some virtual/stream-only
-             * nodes) -- just leave the meter at 0 rather than erroring. */
-            if (app->level_stream == s) stop_level_monitor(app);
+            /* If this is still the active stream, it failed/terminated on
+             * its own (e.g. device unplugged, or not every node is
+             * recordable to begin with) rather than via stop_level_monitor()
+             * superseding it -- reset the UI too in that case. Either way,
+             * this stream now owns finishing its own teardown: unref only
+             * once the server has actually confirmed termination, not
+             * synchronously back in stop_level_monitor() (see its comment)
+             * -- this runs for a just-superseded stream from a quick device
+             * switch just as much as for the currently active one. */
+            if (app->level_stream == s) {
+                app->level_stream = NULL;
+                app->level_peak = 0.0f;
+                if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+            }
+            pa_stream_set_state_callback(s, NULL, NULL);
+            pa_stream_unref(s);
             break;
         default:
             break;
@@ -602,17 +634,47 @@ static void on_pa_context_state(pa_context *c, void *userdata) {
          * connecting -- start monitoring it now. */
         update_level_monitor(app, app->selected_idx);
     } else if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED) {
+        /* No reconnect here previously (2026-09-24, Barry: "the pw-volctl
+         * level indicator bar graph no longer works... it works OK
+         * otherwise"): freedv-start-diag restarts pipewire+wireplumber on
+         * every FreeDV launch, which kills this long-lived pa_context.
+         * Once FAILED/TERMINATED, this context is a dead object forever --
+         * pa_ready just latched FALSE with nothing ever calling
+         * pa_context_connect() again, so the level meter silently stopped
+         * working for the rest of the process's life while the volume
+         * slider/mute controls kept working fine (those go through
+         * one-shot `wpctl` subprocess calls, unaffected by this stale
+         * context -- see get_wpctl_id()'s own no-caching fix, 2026-09-19,
+         * for the same class of bug on that side). Any stream on this dying
+         * context gets its own PA_STREAM_FAILED via on_level_stream_state,
+         * which already owns its teardown -- not duplicated here. */
         app->pa_ready = FALSE;
+        pa_context_unref(app->pa_ctx);
+        app->pa_ctx = NULL;
+        /* Retry after a short delay rather than immediately -- pipewire is
+         * typically still restarting right when this fires, so an instant
+         * reconnect attempt would likely just fail again. */
+        g_timeout_add_seconds(1, pa_reconnect_timeout, app);
     }
 }
 
-static void pa_init(AppData *app) {
-    app->pa_gmainloop = pa_glib_mainloop_new(NULL);
+static gboolean pa_reconnect_timeout(gpointer user_data) {
+    AppData *app = (AppData *)user_data;
+    if (app->pa_ctx == NULL) pa_connect(app);
+    return G_SOURCE_REMOVE;
+}
+
+static void pa_connect(AppData *app) {
     pa_mainloop_api *api = pa_glib_mainloop_get_api(app->pa_gmainloop);
     app->pa_ctx = pa_context_new(api, "pw-volctl");
     app->pa_ready = FALSE;
     pa_context_set_state_callback(app->pa_ctx, on_pa_context_state, app);
     pa_context_connect(app->pa_ctx, NULL, PA_CONTEXT_NOFLAGS, NULL);
+}
+
+static void pa_init(AppData *app) {
+    app->pa_gmainloop = pa_glib_mainloop_new(NULL);
+    pa_connect(app);
 }
 
 static void update_right_panel(AppData *app, int idx) {
@@ -852,8 +914,15 @@ static void on_toggle_mode(GtkButton *btn, gpointer user_data) {
         while (row) {
             int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "device-idx"));
             if (idx == prev_idx) {
+                /* gtk_list_box_select_row() itself fires the "row-selected"
+                 * signal (connected to on_row_selected -> update_right_panel()),
+                 * so an explicit update_right_panel() call here would run the
+                 * whole thing a second time for the same device -- including
+                 * start_level_monitor(), creating a redundant second level-
+                 * meter stream on every click of this button. Observed live
+                 * as a new pw-volctl node accumulating in qpwgraph on every
+                 * mode-toggle click (2026-09-18). */
                 gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
-                update_right_panel(app, prev_idx);
                 reselected = TRUE;
                 break;
             }
@@ -904,8 +973,10 @@ static void on_revert(GtkButton *btn, gpointer user_data) {
             int idx = GPOINTER_TO_INT(
                 g_object_get_data(G_OBJECT(row), "device-idx"));
             if (idx == prev_idx) {
+                /* See on_toggle_mode()'s comment -- gtk_list_box_select_row()
+                 * already fires "row-selected" (-> update_right_panel()), so
+                 * no explicit call is needed here either. */
                 gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
-                update_right_panel(app, prev_idx);
                 reselected = TRUE;
                 break;
             }
@@ -1115,6 +1186,19 @@ static const char *APP_CSS =
 static void activate(GtkApplication *gtk_app, gpointer user_data) {
     (void)user_data;
 
+    /* GApplication's default flags mean a second launch attempt while this
+     * process is already running doesn't start a new process -- it silently
+     * fires activate() again on THIS one, via D-Bus. Without this guard,
+     * that built an entire second window/AppData/pulse level-monitor
+     * stream from scratch, mutually unaware of the first -- observed live
+     * as two permanently "running" pw-volctl nodes on the same monitor,
+     * since neither AppData ever knew to tear the other down. */
+    static AppData *existing_app = NULL;
+    if (existing_app != NULL) {
+        gtk_window_present(GTK_WINDOW(existing_app->window));
+        return;
+    }
+
     GtkCssProvider *css = gtk_css_provider_new();
     gtk_css_provider_load_from_string(css, APP_CSS);
     gtk_style_context_add_provider_for_display(
@@ -1123,6 +1207,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     AppData *app = g_new0(AppData, 1);
+    existing_app = app;
     app->show_all          = TRUE;
     app->db_mode           = FALSE;
     app->unsaved           = FALSE;
