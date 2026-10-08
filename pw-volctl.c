@@ -2,9 +2,10 @@
  * pw-volctl.c
  * PipeWire Volume Control - GTK4/C
  *
- * Reads the last-used preset file on startup (if any), otherwise reads live
- * volumes from wpctl. Slider changes apply in real time via wpctl.
- * Revert restores the in-memory snapshot of the last loaded/saved file.
+ * Reads live volumes on startup (exact values from PipeWire). Level changes
+ * apply in real time via wpctl.
+ * Revert restores the reference levels: those read live at startup or on
+ * Refresh live, or the last loaded/saved file.
  * Save / Load use a file chooser for named presets.
  *
  * Build:
@@ -232,6 +233,35 @@ static int cmp_device(const void *a, const void *b) {
 
 /* ── Live read from wpctl ────────────────────────────────────────────────── */
 
+/*
+ * Exact volume of a node, as the 0.0-2.0 fraction wpctl uses. `wpctl status`
+ * only prints 2 decimals, which is worth up to ~0.3 dB on WirePlumber's
+ * cubic curve, so read the node's channelVolumes from PipeWire itself:
+ * those are stored cubed (0.5 -> 0.125), so take the cube root of the first
+ * channel. Returns FALSE (leaving *vol alone) if it can't be read.
+ */
+static gboolean get_exact_volume(int id, double *vol) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "pw-cli enum-params %d Props 2>/dev/null", id);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return FALSE;
+    char line[256];
+    gboolean in_channel_volumes = FALSE, found = FALSE;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "Props:channelVolumes")) { in_channel_volumes = TRUE; continue; }
+        if (in_channel_volumes && !found) {
+            char *f = strstr(line, "Float ");
+            if (f) {
+                double cubed = atof(f + 6);
+                if (cubed >= 0.0) { *vol = cbrt(cubed); found = TRUE; }
+            }
+        }
+    }
+    pclose(fp);
+    return found;
+}
+
+
 static void load_live(void) {
     n_devices = 0;
     FILE *fp = popen("wpctl status", "r");
@@ -289,7 +319,8 @@ static void load_live(void) {
         g_strlcpy(devices[n_devices].name,  node_name,        MAX_NAME_LEN);
         g_strlcpy(devices[n_devices].class, node_class,       MAX_CLASS_LEN);
         devices[n_devices].wpctl_id = candidates[i].id;
-        devices[n_devices].vol      = candidates[i].vol;
+        devices[n_devices].vol      = candidates[i].vol;   /* 2-decimal fallback */
+        get_exact_volume(candidates[i].id, &devices[n_devices].vol);
         n_devices++;
     }
     qsort(devices, n_devices, sizeof(Device), cmp_device);
@@ -323,7 +354,7 @@ static void write_file(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) { g_warning("Cannot write: %s", path); return; }
     for (int i = 0; i < n_devices; i++)
-        fprintf(f, "%s|%s|%.2f\n", devices[i].name, devices[i].class, devices[i].vol);
+        fprintf(f, "%s|%s|%.6f\n", devices[i].name, devices[i].class, devices[i].vol);
     fclose(f);
 }
 
@@ -400,7 +431,7 @@ static void apply_volume(int idx) {
     int id = get_wpctl_id(idx);
     if (id < 0) { g_warning("wpctl ID not found for %s", devices[idx].name); return; }
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "wpctl set-volume %d %.2f", id, devices[idx].vol);
+    snprintf(cmd, sizeof(cmd), "wpctl set-volume %d %.6f", id, devices[idx].vol);
     system(cmd);
 }
 
@@ -433,12 +464,12 @@ static void format_level_label(AppData *app, double val, char *out, size_t outle
 }
 
 /*
- * Revert is only enabled when a file is loaded and there are unsaved changes.
- * Save is always available.
+ * Revert is enabled whenever there are unsaved changes since the reference
+ * levels (startup/Refresh live, or the last Load/Save). Save is always
+ * available.
  */
 static void set_unsaved(AppData *app, gboolean unsaved) {
     app->unsaved = unsaved;
-    /* Revert only makes sense if there is a file snapshot to go back to */
     gtk_widget_set_sensitive(app->revert_btn,
         unsaved && n_snapshot > 0);
     gtk_label_set_text(GTK_LABEL(app->status_lbl),
@@ -947,7 +978,7 @@ static void on_refresh_live(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
     load_live();
-    n_snapshot = 0;   /* no file loaded — Revert unavailable */
+    take_snapshot();   /* freshly read live levels become the revert point */
     save_temp();
     populate_list(app);
     update_right_panel(app, -1);
@@ -956,7 +987,7 @@ static void on_refresh_live(GtkButton *btn, gpointer user_data) {
     gtk_label_set_text(GTK_LABEL(app->status_lbl), "Refreshed from live.");
 }
 
-/* Revert: restore snapshot from last Load or Save */
+/* Revert: restore the reference levels (startup/Refresh live, or last Load/Save) */
 static void on_revert(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
@@ -985,7 +1016,7 @@ static void on_revert(GtkButton *btn, gpointer user_data) {
     }
     if (!reselected) update_right_panel(app, -1);
     set_unsaved(app, FALSE);
-    gtk_label_set_text(GTK_LABEL(app->status_lbl), "Reverted to saved levels.");
+    gtk_label_set_text(GTK_LABEL(app->status_lbl), "Reverted.");
 }
 
 /* Save */
@@ -1222,10 +1253,11 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     pa_init(app);
     build_paths();
 
-    /* Always start with live levels — no auto-load */
+    /* Always start with live levels — no auto-load. They are also the
+     * reference for Revert, so changes made in this session can be undone. */
     load_live();
     save_temp();
-    n_snapshot = 0;
+    take_snapshot();
 
     /* ── Window ── */
     app->window = gtk_application_window_new(gtk_app);
@@ -1269,6 +1301,13 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     GtkWidget *toolbar_spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(toolbar_spacer, TRUE);
     gtk_box_append(GTK_BOX(toolbar), toolbar_spacer);
+
+    app->mode_toggle_btn = gtk_button_new_with_label("Mode: %");
+    gtk_widget_add_css_class(app->mode_toggle_btn, "btn-toolbar");
+    gtk_widget_set_tooltip_text(app->mode_toggle_btn,
+        "Click to switch level display/stepping between % and dB");
+    gtk_box_append(GTK_BOX(toolbar), app->mode_toggle_btn);
+    g_signal_connect(app->mode_toggle_btn, "clicked", G_CALLBACK(on_toggle_mode), app);
 
     app->toggle_btn = gtk_button_new_with_label("Showing All");
     gtk_widget_add_css_class(app->toggle_btn, "btn-toolbar");
@@ -1350,15 +1389,8 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     /* ── Step buttons: --  -  +  ++ ── */
     GtkWidget *step_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_widget_set_halign(step_hbox, GTK_ALIGN_START);
+    gtk_box_set_homogeneous(GTK_BOX(step_hbox), TRUE);   /* spread evenly across the panel */
     gtk_box_append(GTK_BOX(ctrl_vbox), step_hbox);
-
-    app->mode_toggle_btn = gtk_button_new_with_label("Mode: %");
-    gtk_widget_add_css_class(app->mode_toggle_btn, "btn-toolbar");
-    gtk_widget_set_tooltip_text(app->mode_toggle_btn,
-        "Click to switch level display/stepping between % and dB");
-    gtk_box_append(GTK_BOX(step_hbox), app->mode_toggle_btn);
-    g_signal_connect(app->mode_toggle_btn, "clicked", G_CALLBACK(on_toggle_mode), app);
 
     app->btn_dec5 = gtk_button_new_with_label("− −");
     gtk_widget_add_css_class(app->btn_dec5, "btn-step");
