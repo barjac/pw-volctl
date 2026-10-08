@@ -26,6 +26,7 @@
 #define TEMP_PATH     "%s/.config/pipewire/pw-volctl.tmp"
 #define LAST_PATH     "%s/.config/pipewire/pw-volctl.last"
 #define DEFAULT_DIR   "%s/.config/pipewire"
+#define STATE_PATH    "%s/.config/pipewire/pw-volctl.state"   /* last mode + selected device */
 
 /* Step sizes for the four level buttons, in each stepping mode. */
 #define PCT_STEP_SMALL 0.01
@@ -60,6 +61,7 @@ static int    n_snapshot = 0;
 
 static char   temp_path[256];
 static char   last_path[256];
+static char   state_path[256];
 static char   default_dir[256];
 
 /* ── Application state ───────────────────────────────────────────────────── */
@@ -127,6 +129,7 @@ static void build_paths(void) {
     const char *home = g_get_home_dir();
     snprintf(temp_path,   sizeof(temp_path),   TEMP_PATH,   home);
     snprintf(last_path,   sizeof(last_path),   LAST_PATH,   home);
+    snprintf(state_path,  sizeof(state_path),  STATE_PATH,  home);
     snprintf(default_dir, sizeof(default_dir), DEFAULT_DIR, home);
     /* Create config directory if it does not exist */
     g_mkdir_with_parents(default_dir, 0755);
@@ -147,6 +150,40 @@ static void write_last_file(const char *path) {
     if (!f) return;
     fprintf(f, "%s\n", path);
     fclose(f);
+}
+
+/* ── Remembered UI state ──────────────────────────────────────────────────── */
+/*
+ * The %/dB mode and the selected device (by name and class, since wpctl IDs
+ * and list order change between sessions) are restored at the next start.
+ */
+static void save_state(gboolean db_mode, int selected_idx) {
+    FILE *f = fopen(state_path, "w");
+    if (!f) return;
+    fprintf(f, "mode=%s\n", db_mode ? "db" : "pct");
+    if (selected_idx >= 0 && selected_idx < n_devices)
+        fprintf(f, "node=%s\nclass=%s\n", devices[selected_idx].name, devices[selected_idx].class);
+    fclose(f);
+}
+
+static void load_state(gboolean *db_mode, char *name, size_t name_len, char *cls, size_t cls_len) {
+    name[0] = cls[0] = '\0';
+    FILE *f = fopen(state_path, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (g_str_has_prefix(line, "mode="))  *db_mode = !strcmp(line + 5, "db");
+        if (g_str_has_prefix(line, "node="))  g_strlcpy(name, line + 5, name_len);
+        if (g_str_has_prefix(line, "class=")) g_strlcpy(cls,  line + 6, cls_len);
+    }
+    fclose(f);
+}
+
+static int find_device(const char *name, const char *cls) {
+    for (int i = 0; name[0] && i < n_devices; i++)
+        if (!strcmp(devices[i].name, name) && !strcmp(devices[i].class, cls)) return i;
+    return -1;
 }
 
 /* ── Snapshot ────────────────────────────────────────────────────────────── */
@@ -739,6 +776,7 @@ static void on_row_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer user_da
     if (!row) { update_right_panel(app, -1); return; }
     int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "device-idx"));
     update_right_panel(app, idx);
+    save_state(app->db_mode, idx);
 }
 
 /* ── Step button helpers ─────────────────────────────────────────────────── */
@@ -923,44 +961,46 @@ static void update_step_button_tooltips(AppData *app) {
     }
 }
 
+/*
+ * Reselects device idx in the (just rebuilt) list, or clears the right panel
+ * if it isn't shown. populate_list() rebuilds the list from scratch, which
+ * drops GTK's row selection, so callers that rebuild it restore it here.
+ * gtk_list_box_select_row() itself fires "row-selected" (connected to
+ * on_row_selected -> update_right_panel()), so no explicit
+ * update_right_panel() call is made when the row is found: doing so would
+ * run it twice for the same device, including start_level_monitor(),
+ * creating a redundant second level-meter stream (observed live as a new
+ * pw-volctl node accumulating in qpwgraph on every click, 2026-09-18).
+ */
+static void reselect_device(AppData *app, int idx) {
+    if (idx >= 0) {
+        GtkListBoxRow *row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(app->list_box), 0);
+        while (row) {
+            if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "device-idx")) == idx) {
+                gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
+                return;
+            }
+            row = GTK_LIST_BOX_ROW(gtk_widget_get_next_sibling(GTK_WIDGET(row)));
+        }
+    }
+    update_right_panel(app, -1);
+}
+
 static void on_toggle_mode(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
     app->db_mode = !app->db_mode;
+    save_state(app->db_mode, app->selected_idx);
     /* Label reads as the CURRENT mode, not the action a click performs. */
     gtk_button_set_label(GTK_BUTTON(app->mode_toggle_btn),
         app->db_mode ? "Mode: dB" : "Mode: %");
     update_step_button_tooltips(app);
 
     /* Re-render every visible level in the new mode's units immediately,
-     * not just after the next step button press. populate_list() rebuilds
-     * the list from scratch, which drops the row selection (same reason
-     * on_revert() below has to manually re-find and reselect afterward) --
-     * so capture and restore it here too. */
+     * not just after the next step button press. */
     int prev_idx = app->selected_idx;
     populate_list(app);
-    gboolean reselected = FALSE;
-    if (prev_idx >= 0) {
-        GtkListBoxRow *row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(app->list_box), 0);
-        while (row) {
-            int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "device-idx"));
-            if (idx == prev_idx) {
-                /* gtk_list_box_select_row() itself fires the "row-selected"
-                 * signal (connected to on_row_selected -> update_right_panel()),
-                 * so an explicit update_right_panel() call here would run the
-                 * whole thing a second time for the same device -- including
-                 * start_level_monitor(), creating a redundant second level-
-                 * meter stream on every click of this button. Observed live
-                 * as a new pw-volctl node accumulating in qpwgraph on every
-                 * mode-toggle click (2026-09-18). */
-                gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
-                reselected = TRUE;
-                break;
-            }
-            row = GTK_LIST_BOX_ROW(gtk_widget_get_next_sibling(GTK_WIDGET(row)));
-        }
-    }
-    if (!reselected) update_right_panel(app, -1);
+    reselect_device(app, prev_idx);
 }
 
 static void on_toggle_show_all(GtkButton *btn, gpointer user_data) {
@@ -977,11 +1017,18 @@ static void on_toggle_show_all(GtkButton *btn, gpointer user_data) {
 static void on_refresh_live(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppData *app = (AppData *)user_data;
+    /* Device order can change after a re-read, so remember the selected
+     * device by name and class rather than by index. */
+    char sel_name[MAX_NAME_LEN] = {0}, sel_class[MAX_CLASS_LEN] = {0};
+    if (app->selected_idx >= 0 && app->selected_idx < n_devices) {
+        g_strlcpy(sel_name,  devices[app->selected_idx].name,  sizeof(sel_name));
+        g_strlcpy(sel_class, devices[app->selected_idx].class, sizeof(sel_class));
+    }
     load_live();
     take_snapshot();   /* freshly read live levels become the revert point */
     save_temp();
     populate_list(app);
-    update_right_panel(app, -1);
+    reselect_device(app, find_device(sel_name, sel_class));
     set_unsaved(app, FALSE);
     set_current_file(app, NULL);
     gtk_label_set_text(GTK_LABEL(app->status_lbl), "Refreshed from live.");
@@ -995,26 +1042,7 @@ static void on_revert(GtkButton *btn, gpointer user_data) {
     restore_snapshot();
     save_temp();
     populate_list(app);
-    /* Re-select the previously selected device if it is still in the list */
-    gboolean reselected = FALSE;
-    if (prev_idx >= 0 && prev_idx < n_devices) {
-        GtkListBoxRow *row = gtk_list_box_get_row_at_index(
-            GTK_LIST_BOX(app->list_box), 0);
-        while (row) {
-            int idx = GPOINTER_TO_INT(
-                g_object_get_data(G_OBJECT(row), "device-idx"));
-            if (idx == prev_idx) {
-                /* See on_toggle_mode()'s comment -- gtk_list_box_select_row()
-                 * already fires "row-selected" (-> update_right_panel()), so
-                 * no explicit call is needed here either. */
-                gtk_list_box_select_row(GTK_LIST_BOX(app->list_box), row);
-                reselected = TRUE;
-                break;
-            }
-            row = GTK_LIST_BOX_ROW(gtk_widget_get_next_sibling(GTK_WIDGET(row)));
-        }
-    }
-    if (!reselected) update_right_panel(app, -1);
+    reselect_device(app, prev_idx < n_devices ? prev_idx : -1);
     set_unsaved(app, FALSE);
     gtk_label_set_text(GTK_LABEL(app->status_lbl), "Reverted.");
 }
@@ -1253,6 +1281,9 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     pa_init(app);
     build_paths();
 
+    char start_node[MAX_NAME_LEN], start_class[MAX_CLASS_LEN];
+    load_state(&app->db_mode, start_node, sizeof(start_node), start_class, sizeof(start_class));
+
     /* Always start with live levels — no auto-load. They are also the
      * reference for Revert, so changes made in this session can be undone. */
     load_live();
@@ -1302,7 +1333,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_widget_set_hexpand(toolbar_spacer, TRUE);
     gtk_box_append(GTK_BOX(toolbar), toolbar_spacer);
 
-    app->mode_toggle_btn = gtk_button_new_with_label("Mode: %");
+    app->mode_toggle_btn = gtk_button_new_with_label(app->db_mode ? "Mode: dB" : "Mode: %");
     gtk_widget_add_css_class(app->mode_toggle_btn, "btn-toolbar");
     gtk_widget_set_tooltip_text(app->mode_toggle_btn,
         "Click to switch level display/stepping between % and dB");
@@ -1449,7 +1480,9 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_box_append(GTK_BOX(root_vbox), status_bar);
 
 
+    update_step_button_tooltips(app);   /* match a restored dB mode */
     populate_list(app);
+    reselect_device(app, find_device(start_node, start_class));
     gtk_window_present(GTK_WINDOW(app->window));
 }
 
