@@ -17,7 +17,7 @@ example, one set of levels for 40m operation, another for 80m).
 
 The window has four areas:
 
-- **Toolbar** (across the top) — Load, Save, Revert, Show all devices, Refresh live
+- **Toolbar** (across the top) — Load, Save, Revert, Mode (% or dB), Showing All / Active Only, Refresh live
 - **Left panel** — the scrolling list of audio devices and their current levels
 - **Right panel** — the name, type, percentage, and step buttons for the selected device
 - **Status bar** (across the bottom) — shows what the program last did
@@ -28,24 +28,32 @@ The window has four areas:
 
 1. Click on a device in the list on the left to select it.
 2. The device name, type, and current level appear on the right.
-3. Use the four buttons to adjust the level in precise steps:
-   - **− −** decreases by 5%
-   - **−** decreases by 1%
-   - **+** increases by 1%
-   - **+ +** increases by 5%
-4. Each button press takes effect immediately and the percentage display updates.
+3. Use the four buttons to adjust the level in precise steps. What a step
+   is depends on the **Mode** button in the toolbar:
+
+   | Button | Mode: % | Mode: dB |
+   |---|---|---|
+   | **− −** | −5% | −3 dB |
+   | **−** | −1% | −0.1 dB |
+   | **+** | +1% | +0.1 dB |
+   | **+ +** | +5% | +3 dB |
+
+   Hold a button down to repeat the step.
+4. Each button press takes effect immediately and the level display updates.
+   Levels are set and read back exactly, so a level set in dB reads back as
+   the same dB value.
 
 ---
 
 ## The Device List
 
-By default, only devices that are set below 100% are shown, since these are
-the ones most likely to need adjustment.
+By default all devices are shown (**Showing All**).
 
 The buttons for managing the list are in the toolbar at the top of the window:
 
-- Press **Show all devices** to reveal everything, including devices at full level.
-- Press **Show active only** to return to the filtered view.
+- Press **Showing All** to switch to **Active Only**, which hides devices at
+  exactly 100% (0 dB) so only adjusted ones are listed. Press it again to show
+  everything.
 - Press **Refresh live** to re-read the current levels from the system.
   Use this if something outside the program has changed a level.
 
@@ -67,25 +75,24 @@ The window title will update to show the name of the file you saved to.
 Press **Load**. A file chooser will appear. Select the file you want and
 press Open. All levels in the file will be applied immediately.
 
-The program remembers the last file you used and will load it automatically
-the next time you start.
+The program always starts from the live levels; it does not load a file
+automatically. It remembers the last file you used and opens the file chooser
+there next time.
 
 ---
 
 ## Reverting Changes
 
-If you have adjusted some levels since loading or saving a file and want to
-go back to what the file contained, press **Revert**.
+If you have adjusted some levels and want to go back, press **Revert**. It
+returns every device to the *reference* levels, which are taken:
 
-This button is only available when:
-- A file has been loaded or saved in the current session, **and**
-- You have made at least one change since then
+- when the program starts (the live levels at that moment),
+- when you press **Refresh live**,
+- when you load or save a file.
 
-Revert is not available after **Refresh live**, because in that case there is
-no saved reference point to go back to.
-
-> **Note:** Revert goes back to the last loaded or saved *file*, not to the
-> levels that were set when you started the program.
+So if you change, say, the mic level and forget what it was, Revert puts it
+back to where it was when you opened the program. Revert is available whenever
+there are changes since the reference.
 
 ---
 
@@ -95,10 +102,10 @@ The strip along the bottom of the window shows brief messages:
 
 | Message | Meaning |
 |---|---|
-| ⚠ Unsaved changes | Levels have been adjusted since the last Save or Load |
+| ⚠ Unsaved changes | Levels have been adjusted since the reference (start, Refresh live, Load or Save) |
 | Saved. | The current levels have been written to a file |
 | Loaded. | A file has been read and its levels applied |
-| Reverted to saved levels. | Levels restored from the last file |
+| Reverted. | Levels restored to the reference |
 | Refreshed from live. | Levels re-read from the system |
 
 ---
