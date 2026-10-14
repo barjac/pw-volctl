@@ -43,6 +43,15 @@ The window has four areas:
    Levels are set and read back exactly, so a level set in dB reads back as
    the same dB value.
 
+### The level meter
+
+The bar under the buttons shows the live peak level of the selected device,
+after its own level setting. It is in dB: the left end is −50 dBFS, the
+right end of the green part is 0 dBFS (full scale), with a faint tick every
+10 dB and its value (−40 … 0) underneath. The small red section at the right end lights up when the signal
+reaches 0 dBFS, i.e. it is clipping, and stays lit for 1.5 seconds so a
+short clip isn't missed.
+
 ---
 
 ## The Device List

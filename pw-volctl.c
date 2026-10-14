@@ -34,13 +34,20 @@
 #define DB_STEP_SMALL  0.1
 #define DB_STEP_LARGE  3.0
 
-/* dBFS level that maps to 100% on the live level meter's display. Not true
- * 0dBFS -- normal listening rarely peaks anywhere near true full scale, so
- * leaving the meter calibrated to true 0dBFS wastes most of its visible
- * range. Display-only: app->level_peak itself stays the true, unscaled
- * peak; this is applied at draw time. Empirically tunable by eye/ear if
- * this value doesn't feel right, same as freedv-gui's own level meter. */
-#define LEVEL_METER_REFERENCE_DB (-6.0f)
+/* Live level meter scale: the bar is in dB, from LEVEL_METER_FLOOR_DB at
+ * the left to true 0dBFS at the right end, where the red clip section
+ * starts. A dB scale keeps quiet and normal speech levels apart, which a
+ * linear bar squashes into its first few pixels. */
+#define LEVEL_METER_FLOOR_DB   (-50.0f)
+#define LEVEL_METER_TICK_DB    10.0f
+/* A peak at or above this is clipping: 0dBFS, less the 16-bit rounding
+ * margin, since a float sample can't go higher once converted to 16 bits. */
+#define LEVEL_METER_CLIP       0.9999f
+/* How long the clip section stays lit after a clip, so a short one is seen. */
+#define LEVEL_METER_CLIP_HOLD_MS 1500
+#define LEVEL_METER_CLIP_WIDTH 10      /* px at the right end of the bar */
+#define LEVEL_METER_BAR_HEIGHT 10      /* px; the dB scale's values go below it */
+#define LEVEL_METER_SCALE_HEIGHT 12
 
 /* ── Data model ─────────────────────────────────────────────────────────── */
 
@@ -95,7 +102,10 @@ typedef struct {
     pa_context        *pa_ctx;
     gboolean           pa_ready;       /* pa_ctx has reached PA_CONTEXT_READY */
     pa_stream         *level_stream;   /* NULL when not monitoring any device */
-    float              level_peak;     /* 0.0-1.0, most recent peak from level_stream */
+    float              level_peak;     /* most recent peak from level_stream, after the
+                                        * device's volume (above 1.0 = over 0dBFS) */
+    gint64             clip_until;     /* monotonic us: clip section lit until then */
+    guint              clip_timeout_id;/* 0 = no clip-hold redraw pending */
 } AppData;
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
@@ -582,7 +592,15 @@ static void stop_level_monitor(AppData *app) {
         pa_stream_disconnect(s);
     }
     app->level_peak = 0.0f;
+    app->clip_until = 0;   /* a clip on the previous device isn't this one's */
     if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+}
+
+static gboolean on_clip_hold_end(gpointer user_data) {
+    AppData *app = (AppData *)user_data;
+    app->clip_timeout_id = 0;
+    if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+    return G_SOURCE_REMOVE;
 }
 
 static void on_level_stream_read(pa_stream *s, size_t length, void *userdata) {
@@ -619,6 +637,12 @@ static void on_level_stream_read(pa_stream *s, size_t length, void *userdata) {
         gain = vol * vol * vol;
     }
     app->level_peak = peak * gain;
+    if (app->level_peak >= LEVEL_METER_CLIP) {
+        app->clip_until = g_get_monotonic_time() + LEVEL_METER_CLIP_HOLD_MS * 1000;
+        /* Redraw once the hold ends, in case no more audio arrives to do it */
+        if (app->clip_timeout_id) g_source_remove(app->clip_timeout_id);
+        app->clip_timeout_id = g_timeout_add(LEVEL_METER_CLIP_HOLD_MS + 50, on_clip_hold_end, app);
+    }
     if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
 }
 
@@ -680,16 +704,54 @@ static void update_level_monitor(AppData *app, int idx) {
 
 static void on_level_meter_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)area;
+    (void)height;
     AppData *app = (AppData *)user_data;
+    const int bar_h = LEVEL_METER_BAR_HEIGHT;
     cairo_set_source_rgb(cr, 0.11, 0.14, 0.17);
     cairo_paint(cr);
-    float frac = app->level_peak / powf(10.0f, LEVEL_METER_REFERENCE_DB / 20.0f);
+
+    /* Green bar from the floor up to 0dBFS, then the clip section */
+    int bar_w = width - LEVEL_METER_CLIP_WIDTH;
+    if (bar_w < 1) bar_w = 1;
+    float db = app->level_peak > 0.0f ? 20.0f * log10f(app->level_peak) : LEVEL_METER_FLOOR_DB;
+    float frac = (db - LEVEL_METER_FLOOR_DB) / -LEVEL_METER_FLOOR_DB;
     if (frac > 1.0f) frac = 1.0f;
-    if (frac < 0.0f) frac = 0.0f;
     if (frac > 0.0f) {
         cairo_set_source_rgb(cr, 0.0, 0.78, 0.0);
-        cairo_rectangle(cr, 0, 0, width * frac, height);
+        cairo_rectangle(cr, 0, 0, bar_w * frac, bar_h);
         cairo_fill(cr);
+    }
+
+    /* Ticks every 10dB, over the bar so they show on both lit and dark parts */
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.45);
+    for (float t = LEVEL_METER_FLOOR_DB + LEVEL_METER_TICK_DB; t < 0.0f; t += LEVEL_METER_TICK_DB) {
+        double x = floor(bar_w * (t - LEVEL_METER_FLOOR_DB) / -LEVEL_METER_FLOOR_DB) + 0.5;
+        cairo_move_to(cr, x, 0);
+        cairo_line_to(cr, x, bar_h);
+    }
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    /* Clip section: bright red while a clip is held, dim red otherwise */
+    gboolean clipping = g_get_monotonic_time() < app->clip_until;
+    if (clipping) cairo_set_source_rgb(cr, 0.95, 0.10, 0.10);
+    else          cairo_set_source_rgb(cr, 0.35, 0.08, 0.08);
+    cairo_rectangle(cr, bar_w + 1, 0, LEVEL_METER_CLIP_WIDTH - 1, bar_h);
+    cairo_fill(cr);
+
+    /* The scale's values under the ticks, and 0 where the clip section starts */
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, LEVEL_METER_SCALE_HEIGHT - 3);
+    cairo_set_source_rgb(cr, 0.75, 0.78, 0.80);
+    for (float t = LEVEL_METER_FLOOR_DB + LEVEL_METER_TICK_DB; t <= 0.0f; t += LEVEL_METER_TICK_DB) {
+        char label[8];
+        snprintf(label, sizeof(label), "%.0f", t);
+        cairo_text_extents_t ext;
+        cairo_text_extents(cr, label, &ext);
+        double x = bar_w * (t - LEVEL_METER_FLOOR_DB) / -LEVEL_METER_FLOOR_DB - ext.width / 2 - ext.x_bearing;
+        if (x + ext.width > width) x = width - ext.width;   /* keep 0 inside the right edge */
+        cairo_move_to(cr, x, bar_h + LEVEL_METER_SCALE_HEIGHT - 2);
+        cairo_show_text(cr, label);
     }
 }
 
@@ -1277,6 +1339,8 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     app->lbl_file        = NULL;   /* created during widget build */
     app->level_stream    = NULL;
     app->level_peak      = 0.0f;
+    app->clip_until      = 0;
+    app->clip_timeout_id = 0;
 
     pa_init(app);
     build_paths();
@@ -1412,7 +1476,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     /* ── Live level meter (real signal presence, not just configured volume) ── */
     app->level_meter = gtk_drawing_area_new();
-    gtk_widget_set_size_request(app->level_meter, -1, 10);
+    gtk_widget_set_size_request(app->level_meter, -1, LEVEL_METER_BAR_HEIGHT + LEVEL_METER_SCALE_HEIGHT);
     gtk_widget_set_tooltip_text(app->level_meter, "Live signal level for the selected device");
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(app->level_meter),
         on_level_meter_draw, app, NULL);
