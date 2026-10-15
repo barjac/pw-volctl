@@ -52,6 +52,10 @@ right end of the green part is 0 dBFS (full scale), with a faint tick every
 reaches 0 dBFS, i.e. it is clipping, and stays lit for 1.5 seconds so a
 short clip isn't missed.
 
+The bar moves like a BBC PPM: it rises at once to each peak, then falls
+steadily at 24dB in 2.8s, so peaks are easy to read. It is redrawn
+20 times a second.
+
 ---
 
 ## The Device List

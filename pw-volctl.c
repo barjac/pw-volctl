@@ -45,6 +45,11 @@
 #define LEVEL_METER_CLIP       0.9999f
 /* How long the clip section stays lit after a clip, so a short one is seen. */
 #define LEVEL_METER_CLIP_HOLD_MS 1500
+/* The bar is redrawn on a timer, not for every block of audio. */
+#define LEVEL_METER_REFRESH_MS 50
+/* BBC PPM ballistics (IEC 60268-10 Type IIa): instant rise, then a fall of
+ * 24dB in 2.8s, a constant rate on a dB scale. */
+#define LEVEL_METER_DECAY_DB_PER_S (24.0f / 2.8f)
 #define LEVEL_METER_CLIP_WIDTH 10      /* px at the right end of the bar */
 #define LEVEL_METER_BAR_HEIGHT 10      /* px; the dB scale's values go below it */
 #define LEVEL_METER_SCALE_HEIGHT 12
@@ -102,8 +107,11 @@ typedef struct {
     pa_context        *pa_ctx;
     gboolean           pa_ready;       /* pa_ctx has reached PA_CONTEXT_READY */
     pa_stream         *level_stream;   /* NULL when not monitoring any device */
-    float              level_peak;     /* most recent peak from level_stream, after the
+    float              level_peak;     /* level the bar shows (PPM ballistics), after the
                                         * device's volume (above 1.0 = over 0dBFS) */
+    float              level_in;       /* highest peak from level_stream since the last
+                                        * refresh tick */
+    gint64             level_last_us;  /* monotonic us of the last refresh tick */
     gint64             clip_until;     /* monotonic us: clip section lit until then */
     guint              clip_timeout_id;/* 0 = no clip-hold redraw pending */
 } AppData;
@@ -592,6 +600,7 @@ static void stop_level_monitor(AppData *app) {
         pa_stream_disconnect(s);
     }
     app->level_peak = 0.0f;
+    app->level_in = 0.0f;
     app->clip_until = 0;   /* a clip on the previous device isn't this one's */
     if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
 }
@@ -636,14 +645,38 @@ static void on_level_stream_read(pa_stream *s, size_t length, void *userdata) {
         float vol = (float)devices[app->selected_idx].vol;
         gain = vol * vol * vol;
     }
-    app->level_peak = peak * gain;
-    if (app->level_peak >= LEVEL_METER_CLIP) {
+    peak *= gain;
+    if (peak > app->level_in) app->level_in = peak;
+    if (peak >= LEVEL_METER_CLIP) {
         app->clip_until = g_get_monotonic_time() + LEVEL_METER_CLIP_HOLD_MS * 1000;
         /* Redraw once the hold ends, in case no more audio arrives to do it */
         if (app->clip_timeout_id) g_source_remove(app->clip_timeout_id);
         app->clip_timeout_id = g_timeout_add(LEVEL_METER_CLIP_HOLD_MS + 50, on_clip_hold_end, app);
     }
-    if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+    /* on_level_tick() moves the bar and redraws it */
+}
+
+/* Every LEVEL_METER_REFRESH_MS: the bar jumps up to the highest peak since
+ * the last tick, or falls at the PPM rate, whichever is higher. Redrawing
+ * here rather than for every block of audio keeps the meter cheap, which
+ * matters on a Raspberry Pi 4. No redraw while the bar is at rest. */
+static gboolean on_level_tick(gpointer user_data) {
+    AppData *app = (AppData *)user_data;
+    gint64 now = g_get_monotonic_time();
+    float dt = app->level_last_us ? (now - app->level_last_us) / 1e6f : 0.0f;
+    app->level_last_us = now;
+
+    float shown = app->level_peak;
+    float next = shown * powf(10.0f, -LEVEL_METER_DECAY_DB_PER_S * dt / 20.0f);
+    if (app->level_in > next) next = app->level_in;
+    app->level_in = 0.0f;
+    if (next < powf(10.0f, LEVEL_METER_FLOOR_DB / 20.0f)) next = 0.0f;
+
+    if (next != shown) {
+        app->level_peak = next;
+        if (app->level_meter) gtk_widget_queue_draw(app->level_meter);
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 static void on_level_stream_state(pa_stream *s, void *userdata) {
@@ -685,7 +718,7 @@ static void start_level_monitor(AppData *app, const char *pulse_device_name) {
     pa_stream_set_read_callback(s, on_level_stream_read, app);
     pa_stream_set_state_callback(s, on_level_stream_state, app);
 
-    /* 1024 frames (~21 ms, ~47 meter updates a second). With
+    /* 1024 frames (~21 ms) per block of audio. With
      * PA_STREAM_ADJUST_LATENCY the fragment becomes the stream's latency
      * request, and PipeWire runs the device's whole graph at the smallest
      * request among its streams: the old 512 bytes (128 frames, ~3 ms)
@@ -1348,6 +1381,8 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     app->lbl_file        = NULL;   /* created during widget build */
     app->level_stream    = NULL;
     app->level_peak      = 0.0f;
+    app->level_in        = 0.0f;
+    app->level_last_us   = 0;
     app->clip_until      = 0;
     app->clip_timeout_id = 0;
 
@@ -1490,6 +1525,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(app->level_meter),
         on_level_meter_draw, app, NULL);
     gtk_box_append(GTK_BOX(ctrl_vbox), app->level_meter);
+    g_timeout_add(LEVEL_METER_REFRESH_MS, on_level_tick, app);
 
     /* ── Step buttons: --  -  +  ++ ── */
     GtkWidget *step_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
