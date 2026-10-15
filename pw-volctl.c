@@ -677,14 +677,23 @@ static void start_level_monitor(AppData *app, const char *pulse_device_name) {
     stop_level_monitor(app);
     if (!app->pa_ready || !app->pa_ctx) return;
 
-    pa_sample_spec ss = { .format = PA_SAMPLE_FLOAT32LE, .rate = 44100, .channels = 1 };
+    /* 48 kHz, the graph's own rate, so the meter needs no resampler. */
+    pa_sample_spec ss = { .format = PA_SAMPLE_FLOAT32LE, .rate = 48000, .channels = 1 };
     pa_stream *s = pa_stream_new(app->pa_ctx, "pw-volctl level meter", &ss, NULL);
     if (!s) return;
 
     pa_stream_set_read_callback(s, on_level_stream_read, app);
     pa_stream_set_state_callback(s, on_level_stream_state, app);
 
-    pa_buffer_attr attr = { .maxlength = (uint32_t)-1, .fragsize = 512 };
+    /* 1024 frames (~21 ms, ~47 meter updates a second). With
+     * PA_STREAM_ADJUST_LATENCY the fragment becomes the stream's latency
+     * request, and PipeWire runs the device's whole graph at the smallest
+     * request among its streams: the old 512 bytes (128 frames, ~3 ms)
+     * forced quantum 128 on a mic FreeDV was using, and on a Raspberry Pi 4
+     * that gave constant xruns and choppy transmit audio. Keep this above
+     * the graph's normal quantum (512 or 1024). */
+    pa_buffer_attr attr = { .maxlength = (uint32_t)-1,
+                            .fragsize = 1024 * sizeof(float) };
     pa_stream_flags_t flags = PA_STREAM_ADJUST_LATENCY | PA_STREAM_PEAK_DETECT;
     if (pa_stream_connect_record(s, pulse_device_name, &attr, flags) < 0) {
         pa_stream_unref(s);
