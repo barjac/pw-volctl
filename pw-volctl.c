@@ -121,6 +121,7 @@ static int   load_file(const char *path);
 static void  write_file(const char *path);
 static void  save_temp(void);
 static void  apply_volume(int idx);
+static void  apply_volume_wpctl(int idx);
 static void  apply_all_volumes(void);
 static void  populate_list(AppData *app);
 static void  update_right_panel(AppData *app, int idx);
@@ -481,13 +482,71 @@ static int get_wpctl_id(int idx) {
     return -1;
 }
 
-static void apply_volume(int idx) {
+static void apply_volume_wpctl(int idx) {
     if (idx < 0 || idx >= n_devices) return;
     int id = get_wpctl_id(idx);
     if (id < 0) { g_warning("wpctl ID not found for %s", devices[idx].name); return; }
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "wpctl set-volume %d %.6f", id, devices[idx].vol);
     system(cmd);
+}
+
+/*
+ * Sets a level through the PulseAudio connection the level meter already
+ * has, instead of `wpctl`: each wpctl run takes about 0.1s on a Raspberry
+ * Pi 4, and get_wpctl_id() needs up to a dozen of them, so a button press
+ * took up to a second to show. pipewire-pulse finds the node by name, so
+ * the new IDs after a PipeWire restart don't matter here, and its volume is
+ * on the same cubic scale as wpctl's fraction (PA_VOLUME_NORM = 1.0). Falls
+ * back to wpctl while the connection isn't ready, or if the node isn't found.
+ */
+static AppData *pa_app;   /* for apply_volume(), which has no AppData */
+
+typedef struct { int idx; double vol; } PaVolumeReq;
+
+static pa_volume_t to_pa_volume(double vol) {
+    double v = vol * PA_VOLUME_NORM;
+    if (v > PA_VOLUME_MAX) v = PA_VOLUME_MAX;
+    return (pa_volume_t)lround(v);
+}
+
+static void on_pa_sink_info(pa_context *c, const pa_sink_info *i, int eol, void *userdata) {
+    PaVolumeReq *req = userdata;
+    if (i) {
+        pa_cvolume cv;
+        pa_cvolume_set(&cv, i->channel_map.channels, to_pa_volume(req->vol));
+        pa_operation *o = pa_context_set_sink_volume_by_index(c, i->index, &cv, NULL, NULL);
+        if (o) pa_operation_unref(o);
+        return;
+    }
+    if (eol < 0) apply_volume_wpctl(req->idx);
+    g_free(req);
+}
+
+static void on_pa_source_info(pa_context *c, const pa_source_info *i, int eol, void *userdata) {
+    PaVolumeReq *req = userdata;
+    if (i) {
+        pa_cvolume cv;
+        pa_cvolume_set(&cv, i->channel_map.channels, to_pa_volume(req->vol));
+        pa_operation *o = pa_context_set_source_volume_by_index(c, i->index, &cv, NULL, NULL);
+        if (o) pa_operation_unref(o);
+        return;
+    }
+    if (eol < 0) apply_volume_wpctl(req->idx);
+    g_free(req);
+}
+
+static void apply_volume(int idx) {
+    if (idx < 0 || idx >= n_devices) return;
+    if (!pa_app || !pa_app->pa_ready || !pa_app->pa_ctx) { apply_volume_wpctl(idx); return; }
+    PaVolumeReq *req = g_new(PaVolumeReq, 1);
+    req->idx = idx;
+    req->vol = devices[idx].vol;
+    pa_operation *o = strstr(devices[idx].class, "Sink")
+        ? pa_context_get_sink_info_by_name(pa_app->pa_ctx, devices[idx].name, on_pa_sink_info, req)
+        : pa_context_get_source_info_by_name(pa_app->pa_ctx, devices[idx].name, on_pa_source_info, req);
+    if (o) pa_operation_unref(o);
+    else { g_free(req); apply_volume_wpctl(idx); }
 }
 
 static void apply_all_volumes(void) {
@@ -845,6 +904,7 @@ static void pa_connect(AppData *app) {
 }
 
 static void pa_init(AppData *app) {
+    pa_app = app;
     app->pa_gmainloop = pa_glib_mainloop_new(NULL);
     pa_connect(app);
 }
